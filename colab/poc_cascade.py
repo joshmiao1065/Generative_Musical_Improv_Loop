@@ -61,9 +61,9 @@ USER_LOOP_PATH = "user_loop.wav"    # path to test audio file; upload to Colab f
 OUTPUT_PATH    = "cascade_output.wav"
 
 BPM            = 120
-BEATS_PER_LOOP = 8                  # 8 beats = 2 bars at 4/4
+BEATS_PER_LOOP = 16                  # 8 beats = 2 bars at 4/4
 N_PASSES       = 6                  # how many full loops to generate
-N_AI_VOICES    = 2                  # 2–4; each additional voice adds ~N_PASSES chunks of generation
+N_AI_VOICES    = 3                  # 2–4; each additional voice adds ~N_PASSES chunks of generation
 
 # Style prompts — one per voice. Each describes the instrument's musical role.
 VOICE_STYLES = [
