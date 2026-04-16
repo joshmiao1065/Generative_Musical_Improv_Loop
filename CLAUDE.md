@@ -3,16 +3,18 @@
 > **Project for**: Cooper Union — Generative Machine Learning, Final Project
 > **Developer**: Josh Miao
 > **Goal**: A Python terminal script that orchestrates up to 4 parallel AI music instruments and a live human player, synchronized in real-time, controlled by the intech PBF4 MIDI controller.
-> **Last Updated**: 2026-04-15 (Session 3 — MicroLab mk3 confirmed, VB-Cable verified, cloud-only deployment locked in, Analog Lab routing chain clarified)
+> **Last Updated**: 2026-04-15 (Session 4 — Surge XT prototype locked in, monitoring strategy decided, GitHub noted, software swappability architecture designed)
+> **GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop (`git@github.com:joshmiao1065/Generative_Musical_Improv_Loop.git`)
 
 ---
 
 ## CRITICAL NOTICE FOR THE IMPLEMENTING LLM
 
-**Before writing a single line of code, read this entire document.** Every design decision, known pitfall, and architectural constraint is documented here. The most common mistake is beginning implementation without fully understanding:
-1. The audio synchronization problem (Section 8)
-2. The Magenta RT deployment model — it is NOT a cloud REST API out of the box (Section 3)
-3. The audio routing chain for the user's synthesizer input (Section 5)
+**Before writing a single line of code, read this entire document.** Every design decision, known pitfall, and architectural constraint is documented here. The most common mistakes are:
+1. Ignoring the audio synchronization problem (Section 9) — read it first
+2. Writing backend-specific code instead of using the abstract interface (Section 3A) — the whole codebase must be swappable
+3. Assuming Magenta RT is a cloud REST API (it is not — Section 3)
+4. Touching MIDI CC numbers before testing the physical PBF4 hardware (Section 2)
 
 **Autonomous documentation rule**: After every implementation session or significant discovery, the LLM MUST:
 - Update this file (`CLAUDE.md`) with any changes to architecture, confirmed/rejected decisions, or new constraints
@@ -27,22 +29,24 @@ Failing to do this will cause repeated mistakes across sessions.
 
 1. [Project Overview](#1-project-overview)
 2. [Hardware: intech PBF4 Controller](#2-hardware-intech-pbf4-controller)
-3. [AI Backend: Magenta RT — Architecture and Deployment](#3-ai-backend-magenta-rt--architecture-and-deployment)
-4. [User Input Hardware: Arturia MiniLab 3 + Analog Lab](#4-user-input-hardware-arturia-minilab-3--analog-lab)
+3. [AI Backend: Magenta RT and Lyria](#3-ai-backend-magenta-rt-and-lyria)
+   - 3A. [Software Abstraction: AIInstrumentBackend Interface](#3a-software-abstraction-aiinstrumentbackend-interface)
+4. [User Input Hardware: Arturia MicroLab mk3 + Surge XT](#4-user-input-hardware-arturia-microlab-mk3--surge-xt)
 5. [Audio Routing Chain](#5-audio-routing-chain)
-6. [Full System Data Flow Diagram](#6-full-system-data-flow-diagram)
-7. [Loop Architecture and Playback Logic](#7-loop-architecture-and-playback-logic)
-8. [Audio Synchronization Challenges](#8-audio-synchronization-challenges-detailed)
-9. [Genre Blending via Weighted Prompts](#9-genre-blending-via-weighted-prompts)
-10. [Instrument Assignment and AI Instance Management](#10-instrument-assignment-and-ai-instance-management)
-11. [Metronome and Timing Engine](#11-metronome-and-timing-engine)
-12. [Remote Access: SSH + VNC to ThinkPad](#12-remote-access-ssh--vnc-to-thinkpad)
-13. [Python Implementation Plan](#13-python-implementation-plan)
-14. [Dependency Stack](#14-dependency-stack)
-15. [Free Tier / Cost Strategy](#15-free-tier--cost-strategy)
-16. [Runtime Arguments and Configuration](#16-runtime-arguments-and-configuration)
-17. [Open Questions and Decisions Needed](#17-open-questions-and-decisions-needed)
-18. [Documentation Links](#18-documentation-links)
+6. [Software Architecture for Swappability](#6-software-architecture-for-swappability)
+7. [Full System Data Flow Diagram](#7-full-system-data-flow-diagram)
+8. [Loop Architecture and Playback Logic](#8-loop-architecture-and-playback-logic)
+9. [Audio Synchronization Challenges](#9-audio-synchronization-challenges-detailed)
+10. [Genre Blending via Weighted Prompts](#10-genre-blending-via-weighted-prompts)
+11. [Instrument Assignment and AI Instance Management](#11-instrument-assignment-and-ai-instance-management)
+12. [Metronome and Timing Engine](#12-metronome-and-timing-engine)
+13. [Remote Access: SSH + VNC to ThinkPad](#13-remote-access-ssh--vnc-to-thinkpad)
+14. [Python Implementation Plan](#14-python-implementation-plan)
+15. [Dependency Stack](#15-dependency-stack)
+16. [Free Tier / Cost Strategy](#16-free-tier--cost-strategy)
+17. [Runtime Arguments and Configuration](#17-runtime-arguments-and-configuration)
+18. [Open Questions and Decisions Needed](#18-open-questions-and-decisions-needed)
+19. [Documentation Links](#19-documentation-links)
 
 ---
 
@@ -50,17 +54,25 @@ Failing to do this will cause repeated mistakes across sessions.
 
 ### What This Is
 
-A Python terminal script (running on a ThinkPad laptop, accessed remotely via SSH/VNC) that turns a keyboard synthesizer + MIDI controller into an AI improv band. The human player performs a looped phrase using the Arturia MiniLab 3 + Analog Lab synthesizer. Up to 4 AI instrument voices powered by Magenta RT improvise in response, each building on the previous voice's combined output in a cascading loop architecture.
+A Python terminal script (running on a ThinkPad laptop, accessed remotely via SSH/VNC) that turns a keyboard synthesizer + MIDI controller into an AI improv band. The human player performs a looped phrase using the Arturia MicroLab mk3 keyboard running Surge XT (prototype) or Analog Lab (final). Up to 4 AI instrument voices improvise in response, each building on the previous voice's combined output in a cascading loop architecture.
 
-### Physical Setup
+**GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop
+
+### Physical Setup (Confirmed)
 
 ```
-[Arturia MiniLab 3] ──USB-C──→ [ThinkPad]
-[intech PBF4]       ──USB──→  [ThinkPad]
-[ThinkPad]          ──Audio──→ [Speakers/Headphones]
-[Remote machine]    ──SSH/VNC──→ [ThinkPad] (for script control)
+[Arturia MicroLab mk3] ──USB-C MIDI──→ [ThinkPad]
+[intech PBF4]          ──USB MIDI──→  [ThinkPad]
+[ThinkPad]             ──Audio────→   [Speakers/Headphones]
+[Remote machine]       ──SSH/VNC──→   [ThinkPad] (script control)
 
-[ThinkPad] ──HTTP──→ [Magenta RT Server] (Colab TPU or local GPU)
+[ThinkPad] ──HTTP/WebSocket──→ [AI Backend]
+                                  ├── Phase 1: Lyria RealTime API (Google cloud, WebSocket)
+                                  └── Phase 2: Magenta RT (Colab TPU + FastAPI + ngrok)
+
+Software on ThinkPad:
+  Surge XT standalone ──audio──→ VB-Cable ──capture──→ Python script
+  (prototype; swap to Analog Lab + Ableton in later iteration)
 ```
 
 ### Session Flow (High Level)
@@ -150,38 +162,50 @@ Magenta RT is an **800-million parameter open-source autoregressive transformer*
 
 **It is NOT a cloud REST API**. It is a Python library designed to run on TPU (Google Colab) or a high-VRAM GPU (locally).
 
-### Confirmed Parameters (REAL model parameters, not prompt tricks)
+### ✓ CONFIRMED Parameters (verified from actual notebook source code)
 
-| Parameter | Type | Range | Description |
-|-----------|------|-------|-------------|
-| `bpm` | int | 60–200 | Beats per minute — cross-attention conditioned |
-| `guidance` | float | 0.0–6.0 | Prompt adherence strength |
-| `density` | float | 0.0–1.0 | Note density (sparse ↔ busy) |
-| `brightness` | float | 0.0–1.0 | Tonal brightness |
-| `stem_balance` | dict | per-stem floats | Relative instrument loudness in mix |
-| `chromas` | list[float] | 12 values | Harmonic content (pitch class emphasis) |
-| Text prompts | str | — | Style descriptions: "jazz piano", "ambient synth" |
-| Audio prompts | audio | WAV/MP3 | Style conditioning from reference audio |
-| Audio injection | audio | live/recorded | Mixed into context window each step |
+| Parameter | kwarg name | Type | Range | Notes |
+|-----------|-----------|------|-------|-------|
+| Guidance | `guidance_weight` | float | 0.0–10.0 | Controls prompt adherence (CFG weight) |
+| Temperature | `temperature` | float | 0.0–4.0 | **YES — a real parameter** (token sampling) |
+| Top-K | `topk` | int | 0–1024 | **YES — a real parameter** (token sampling) |
+| Model feedback | `model_feedback` | float | 0.0–1.0 | How much AI output feeds back into its own context |
+| Model volume | `model_volume` | float | 0.0–1.0 | Output gain of AI audio |
+| Input volume | `input_volume` | float | 0.0–1.0 | Gain of user audio in output mix |
+| BPM | `bpm` | int | 60–200 | Beats per minute — used for loop/metronome alignment |
+| Beats per loop | `beats_per_loop` | int | 1–16 | Loop length in beats |
+| Input gap | `input_gap` | int (ms) | 0–2000 | Silences end of input window (creates "response space") |
+| Metronome | `metronome` | bool | — | Whether to overlay click track |
+| Text prompt | style embedding | str | — | Passed to `system.embed_style(text)` |
+| Audio prompt | style embedding | audio | 16kHz mono | Passed to `system.embed_style(waveform)` |
+| Audio injection | `context_tokens_orig` | ndarray | (N, 16) int32 | User audio encoded as SpectroStream tokens |
 
-> **"Temperature" and "TopK"**: These are standard LLM token-sampling parameters. The Magenta RT paper and GitHub do not document exposing these directly to end users. Do NOT plan to control these via the PBF4. Use `guidance`, `density`, `brightness` instead.
+> **Correction from earlier sessions**: Temperature and top-k ARE real model parameters in Magenta RT. They are passed via `generate_chunk(**kwargs)`. Update PBF4 knob mappings accordingly — the 4 knobs can control `guidance_weight`, `temperature`, `topk`, and `model_feedback`.
 
-### Audio Injection (Key Feature for This Project)
+### Audio Injection (Key Feature — Fully Documented from Source)
 
-Magenta RT has a dedicated **audio injection** mode (separate Colab notebook):
-- At each inference step, user audio is mixed with model output audio
-- The mixed signal is encoded as SpectroStream coarse tokens
-- These tokens feed into the next generation step as context
-- The model improvises while "hearing" both its own output and the user's input
+Magenta RT audio injection works as follows (verified from notebook source):
 
-This is the exact behavior needed: the user loop is continuously injected, and each AI instance hears the previous cumulative mix.
+1. Each call to `streamer.generate()` receives a chunk of input audio (`inputs`, numpy array, 48kHz stereo)
+2. The input chunk is accumulated into `injection_state.all_inputs`
+3. A window of recent input audio is mixed with a window of recent model output audio: `mix_audio = input_window + output_window * model_feedback`
+4. The mixed audio is encoded to SpectroStream tokens: `mix_tokens = spectrostream_model.encode(mix_audio)`
+5. These tokens replace the model's context window: `state.context_tokens[-N:] = mix_tokens`
+6. The original (pre-mix) context tokens are saved as `context_tokens_orig`
+7. `generate_chunk()` receives both `state.context_tokens` (mixed) and `context_tokens_orig` (clean) — the tied CFG uses both for guidance
+8. Output is 2 seconds of 48kHz stereo audio, crossfaded with previous chunk
+
+**For the cascade**: AI Instance 2's `all_inputs` is the sum of `user_loop + AI_1_output`. This is the "listening" mechanism — each AI literally hears all prior voices via audio injection.
 
 **Audio Injection Colab**: https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Audio_Injection.ipynb
+
+**IMPORTANT: Colab UI is deeply coupled**: The `AudioInjectionStreamer` uses `colab_utils.AudioStreamer` for real-time I/O — this is Colab-specific. For our non-Colab client, we extract only the core logic: `spectrostream_model.encode()`, `injection_state` management, and `generate_chunk()`. The Colab UI widgets are not needed.
 
 ### Deployment Options
 
 #### Option A: Google Colab Free TPU + FastAPI + ngrok (RECOMMENDED FOR PROTOTYPING)
 
+User has access to CoLab Pro using student account
 Architecture:
 ```
 [Colab Notebook on TPU]
@@ -236,6 +260,36 @@ If Magenta RT deployment proves too complex, fall back to Google's **Lyria RealT
 
 **Recommendation**: Start with Colab Magenta RT (Option A) for the free prototyping. Transition to local Option B if ThinkPad GPU is sufficient, or fall back to Lyria (Option C) if Colab proves too unreliable.
 
+### ✓ CONFIRMED: Lyria RealTime API Does NOT Support Audio Injection
+
+Verified from official Google AI docs and developer guide: Lyria RealTime accepts only text (`WeightedPrompts`) and numerical config parameters. There is no audio input of any kind. **Lyria is removed from this project entirely.** Magenta RT is the sole AI backend.
+
+### POC Architecture: Colab Notebook + Pre-Recorded Audio
+
+For the proof of concept (no hardware yet):
+
+```
+[test_loop.wav]  ← any short audio clip, simulates user loop
+      │
+      ▼
+[Colab Notebook — Magenta RT on TPU]
+      │
+      ├── AI Instance 1: inject(user_loop) → ai1_audio
+      │
+      ├── AI Instance 2: inject(user_loop + ai1_audio) → ai2_audio
+      │
+      ├── (optional) AI Instance 3: inject(user_loop + ai1 + ai2) → ai3_audio
+      │
+      └── Final mix = user_loop + ai1_audio + ai2_audio + ...
+                          → saved as output.wav, played in Colab
+```
+
+**POC does not need the FastAPI server** — it all runs within one Colab notebook. The cascade is implemented as a Python loop that calls `AudioInjectionStreamer.generate()` multiple times in sequence. The FastAPI wrapper is added in the next phase.
+
+**Two-phase POC approach**:
+1. **POC Phase A**: Single Colab notebook, sequential generation, proves cascade concept. Use pre-recorded audio as user loop.
+2. **POC Phase B**: Add FastAPI + ngrok to the same notebook, write local Python client, prove over-the-network audio roundtrip.
+
 ### CRITICAL: 4 Parallel Instances on Colab Free Tier
 
 Running 4 simultaneous Magenta RT instances on a single Colab free TPU session is likely not feasible — the model is 800M parameters and each inference call is compute-heavy. Options:
@@ -247,12 +301,27 @@ Running 4 simultaneous Magenta RT instances on a single Colab free TPU session i
 | **C — Lyria API x4** | 4 WebSocket connections to Lyria (cloud, paid) | Clean, truly parallel, has free trial |
 | **D — Single model, voice multiplexing** | One model generates one long prompt per pass, split into 4 | Experimental, loss of instrument separation |
 
-**Recommended path**:
-1. **Prototype with Lyria API (Option C)** — free trial is sufficient to verify the loop architecture. Simpler, genuinely parallel, no server setup.
-2. **Transition to Magenta RT (Option A)** once loop logic is proven — 4 Colab notebooks is clunky but free.
-3. **For final demo**: consider Colab Pro ($10/month) for a single high-memory session that may support 4 instances.
+**Updated recommendation (Lyria eliminated — does not support audio injection)**:
+1. **POC**: Single Colab notebook, 2 sequential AI instances. Proves cascade concept.
+2. **v1**: Same Colab + FastAPI + ngrok + local Python client. Proves network roundtrip.
+3. **v2**: 4 separate Colab notebooks (4 TPU sessions) for genuine parallelism.
+4. **Final**: Colab Pro or sponsored GPU for a consolidated 4-instance session.
 
-> The key insight: Lyria API and Magenta RT both accept audio conditioning and text prompts, so the loop architecture code is nearly identical. Build to an abstract `AIInstrumentClient` interface that can be swapped between backends.
+> The key insight: Lyria API and Magenta RT both accept audio conditioning and text prompts, so the loop architecture code is nearly identical. Build to the abstract `AIInstrumentBackend` interface (Section 6) — swapping backends is a config line change.
+
+---
+
+### 3A. Software Abstraction: AIInstrumentBackend Interface
+
+See **Section 6** for the full swappability architecture. The critical point for AI backends:
+
+- `LyriaBackend` connects via WebSocket, sends `WeightedPrompts` + `guidance` + `density` + `bpm`, receives streaming PCM audio
+- `MagentaRTBackend` connects via HTTP to the Colab FastAPI server, sends base64-encoded audio + params, receives base64-encoded audio chunks
+- Both implement the same `AIInstrumentBackend` abstract interface
+- The `SessionManager` only calls `backend.generate(audio, params)` — it never imports `LyriaBackend` or `MagentaRTBackend` directly
+
+**Phase 1 (current)**: Implement `LyriaBackend` only. Stub out `MagentaRTBackend` with a `NotImplementedError`.
+**Phase 2**: Implement `MagentaRTBackend`. Flip `config.yaml` to use it.
 
 ### Magenta RT Python API (from source inspection)
 
@@ -338,7 +407,7 @@ MicroLab mk3 (USB-C MIDI) → Ableton Live Lite → Analog Lab Intro (VST plugin
 - **VITAL** (free tier, has standalone mode): https://vital.audio/
 - Either can be set to output to VB-Cable directly without Ableton
 
-> **Recommendation for prototype**: Use Surge XT standalone for simplicity. Configure it to output to VB-Cable. Reserve Analog Lab for when the system is stable and you want specific Arturia sounds.
+> **✓ CONFIRMED for prototype**: Use **Surge XT standalone**. Configure it to output to VB-Cable. The Python script handles monitoring (PassthroughMonitor). Transition to Analog Lab + Ableton in v3 once the loop logic is proven — this is a routing change only, no code changes required.
 
 ### MIDI CC from MicroLab mk3
 
@@ -396,23 +465,20 @@ After installing VB-Cable, two new audio devices appear in Windows:
 3. In synth app (Surge XT or Ableton), set audio output device to **"CABLE Input"**
 4. In Python, record from **"CABLE Output"**
 
-### Monitoring: Hearing Your Own Playing
+### ✓ CONFIRMED: Monitoring via Python Script (PassthroughMonitor)
 
-If synth output goes to VB-Cable, you won't hear it through speakers by default.
+The Python script captures audio from VB-Cable and immediately plays it back through the output device in the same audio callback. This is the **lowest-friction, zero-extra-software** approach for prototyping.
 
-**Solution A — Voicemeeter Banana (recommended):**
-- Free: https://voicemeeter.com/
-- Receives from synth, routes simultaneously to VB-Cable AND physical speakers
-- Also lets you control per-source volume
+**Latency added by passthrough**: ~20–40ms roundtrip (VB-Cable buffer + sounddevice buffer). This is imperceptible in a live music context.
 
-**Solution B — Windows Stereo Mix / Listen to this device:**
-- Windows Sound Settings → Recording → "CABLE Output" → Properties → Listen tab
-- Check "Listen to this device" → set playback through speakers
-- Zero-cost but adds latency and is harder to configure
+**How it works**: The output callback in `sounddevice` mixes captured user audio (from VB-Cable) + all AI output buffers and writes the result to speakers. No separate monitoring app needed.
 
-**Solution C — Script handles monitoring:**
-- Python captures from VB-Cable and immediately plays back through output device
-- Adds ~20–40ms of roundtrip latency to monitoring (likely imperceptible)
+```
+VB-Cable Output (Surge XT audio) → Python input callback → audio_queue
+audio_queue + AI output buffers → Python output callback → speakers
+```
+
+**Future upgrade** (v3+): Swap `PassthroughMonitor` for Voicemeeter Banana (https://voicemeeter.com/) to get zero-latency hardware monitoring with per-source volume control. This is a config line change, not a code change, due to the `MonitorPlayback` abstraction.
 
 ### Python Code: Recording from VB-Cable
 
@@ -466,7 +532,149 @@ def prepare_for_injection(audio_48k_stereo: np.ndarray) -> np.ndarray:
 
 ---
 
-## 6. Full System Data Flow Diagram
+## 6. Software Architecture for Swappability
+
+This project will go through multiple iterations swapping out components (synth, AI backend, monitoring). The architecture enforces this through **interface-based abstraction at every boundary**. No module should depend on a concrete implementation of another module — only on its interface.
+
+### Design Principles
+
+1. **Program to interfaces, not implementations**: Every swappable component has an abstract base class. Concrete classes are selected at startup via config, never hardcoded.
+2. **Config-driven construction**: A single `config.yaml` file drives which implementation class is instantiated for each component. Change one line to swap backends.
+3. **No globals**: All shared state (current params, loop buffer, session state) lives in explicitly passed objects, not module-level globals.
+4. **Async-first**: All AI calls, audio streaming, and MIDI callbacks are async-compatible. Use `asyncio` as the runtime.
+5. **Fail loudly, not silently**: If a backend connection drops, raise an exception and log it — do not silently produce silence.
+
+### Abstraction Layers
+
+| Layer | Abstract Base Class | Prototype Implementation | Final Implementation |
+|-------|--------------------|--------------------------|--------------------|
+| AI Backend | `AIInstrumentBackend` | `LyriaBackend` | `MagentaRTBackend` |
+| Audio Capture | `AudioCaptureSource` | `VBCableCapture` | `DirectLineInCapture` |
+| Synthesizer | (external app, not Python-controlled) | Surge XT standalone | Analog Lab + Ableton |
+| Monitoring | `MonitorPlayback` | `PassthroughMonitor` | `VoicemeeterMonitor` |
+| MIDI Controller | `ParameterController` | `PBF4Controller` | (extensible) |
+
+### Abstract Interface Definitions (Pseudocode — for planning, not final code)
+
+```python
+# Every AI backend implements this exact interface
+class AIInstrumentBackend(ABC):
+    @abstractmethod
+    async def connect(self) -> None: ...
+
+    @abstractmethod
+    async def generate(
+        self,
+        audio_input: np.ndarray,   # 16kHz mono float32
+        params: GenerationParams,
+    ) -> np.ndarray: ...            # 48kHz stereo float32
+
+    @abstractmethod
+    async def disconnect(self) -> None: ...
+
+    @abstractmethod
+    def is_connected(self) -> bool: ...
+
+
+# Shared parameter object — passed everywhere, mutated by MIDI callbacks
+@dataclass
+class GenerationParams:
+    bpm: int = 120
+    guidance: float = 4.0
+    density: float = 0.5
+    brightness: float = 0.5
+    instrument: str = "piano"
+    genre_weights: dict[str, float] = field(default_factory=dict)
+
+
+# Audio capture — VB-Cable or line-in
+class AudioCaptureSource(ABC):
+    @abstractmethod
+    def start(self, callback: Callable[[np.ndarray], None]) -> None: ...
+    @abstractmethod
+    def stop(self) -> None: ...
+
+
+# Monitoring — how the user hears their own playing
+class MonitorPlayback(ABC):
+    @abstractmethod
+    def play(self, audio: np.ndarray) -> None: ...
+    @abstractmethod
+    def stop(self) -> None: ...
+```
+
+### Config-Driven Backend Selection (`config.yaml`)
+
+```yaml
+# Change these single lines to swap components — no code changes needed
+
+ai_backend: "lyria"          # options: "lyria" | "magenta_rt"
+audio_capture: "vb_cable"    # options: "vb_cable" | "line_in" | "wasapi_loopback"
+monitoring: "passthrough"    # options: "passthrough" | "voicemeeter" | "none"
+
+bpm: 120
+measures: 4
+sample_rate: 48000
+
+genres:
+  - "jazz"
+  - "blues"
+  - "electronic"
+  - "classical"
+
+instruments:
+  - "piano"
+  - "bass"
+  - "drums"
+  - "violin"
+
+lyria:
+  api_key_env: "GOOGLE_API_KEY"   # reads from environment variable
+  guidance: 4.0
+  density: 0.5
+
+magenta_rt:
+  server_url: "https://your-ngrok-url.ngrok-free.app"
+  guidance: 4.0
+  density: 0.5
+  brightness: 0.5
+
+pbf4:
+  cc_map_file: "config/pbf4_cc_map.json"  # update after hardware test
+```
+
+### Module Dependency Map
+
+```
+improv_loop.py
+    └── loads config.yaml
+    └── constructs concrete classes via factory functions
+    └── passes objects to SessionManager
+
+SessionManager
+    ├── TimingEngine        (no external deps)
+    ├── LoopBuffer          (no external deps)
+    ├── StateMachine        (depends on TimingEngine, LoopBuffer)
+    ├── PBF4Controller      (depends on GenerationParams — mutates it)
+    ├── AudioCaptureSource  (concrete: VBCableCapture)
+    ├── MonitorPlayback     (concrete: PassthroughMonitor)
+    ├── AudioMixer          (reads from all AI instances + loop buffer)
+    └── AIInstanceManager
+            └── AIInstrumentBackend × 4  (concrete: LyriaBackend or MagentaRTBackend)
+```
+
+### Iteration Roadmap
+
+| Iteration | Swap | Effort |
+|-----------|------|--------|
+| v1 (prototype) | Lyria API + Surge XT + PassthroughMonitor | baseline |
+| v2 | Swap Lyria → Magenta RT (change 1 config line + ngrok URL) | low |
+| v3 | Swap Surge XT → Analog Lab + Ableton (change audio routing, not code) | medium |
+| v4 | Swap PassthroughMonitor → Voicemeeter (change 1 config line) | low |
+
+---
+
+## 7. Full System Data Flow Diagram
 
 ```
 ═══════════════════════════════════════════════════════════════════════════
@@ -1031,18 +1239,71 @@ STOPPING
 
 ### Implementation Order
 
-1. **Phase 1**: PBF4 MIDI reading + CC print-out (verify hardware, map CC numbers)
-2. **Phase 2**: Audio capture from VB-Cable/loopback + basic WAV recording
-3. **Phase 3**: Metronome generation + playback via sounddevice
-4. **Phase 4**: Timing engine + loop playback (no AI yet)
-5. **Phase 5**: Magenta RT server (FastAPI on Colab) — single instance, single prompt
-6. **Phase 6**: HTTP client → send user loop → receive AI audio → play back mixed
-7. **Phase 7**: Multi-instance management (cascade)
-8. **Phase 8**: Genre blend fader → prompt weights
-9. **Phase 9**: PBF4 knobs → live Magenta RT parameter updates
-10. **Phase 10**: Re-recording mid-session (double-buffer swap)
-11. **Phase 11**: Error handling, reconnection logic, graceful shutdown
-12. **Phase 12**: Remote access setup (SSH + VNC on ThinkPad)
+Each step must be fully working before moving to the next. Every step ends with a test that can be run independently.
+
+#### Pre-Coding Checklist (MUST complete before any code)
+- [ ] Plug in PBF4 → run `python -c "import mido; [print(m) for m in mido.open_input()]"` → log all CC numbers to `config/pbf4_cc_map.json`
+- [ ] Install Surge XT → set output to VB-Cable → verify audio appears in Windows sound settings
+- [ ] Verify Lyria RealTime API is accessible at https://aistudio.google.com/ (check for "Music Generation" in the model list)
+- [ ] Clone repo, create virtualenv, confirm Python 3.11+ is active
+
+#### Step 1 — Config + Project Skeleton
+- Load `config.yaml` via `pydantic-settings` or `PyYAML`
+- Factory functions that return the correct concrete class based on config
+- Abstract base classes for all 4 layers
+- **Test**: `python improv_loop.py --dry-run` prints loaded config, exits cleanly
+
+#### Step 2 — PBF4 MIDI Monitor
+- `PBF4Controller` reads CC/button events, dispatches to `GenerationParams`
+- **Test**: Move every knob/fader/button, confirm terminal prints correct parameter name + value
+
+#### Step 3 — Audio Capture + Passthrough Monitor
+- `VBCableCapture` records from "CABLE Output" device at 48kHz
+- `PassthroughMonitor` immediately plays captured audio to output device
+- **Test**: Play Surge XT → hear it through speakers with ~30ms delay; record 5 seconds to WAV
+
+#### Step 4 — Metronome + Timing Engine
+- `TimingEngine` drives absolute-time loop boundaries
+- Metronome click track plays on countdown
+- **Test**: `--bpm 120 --measures 4` → metronome plays 8 seconds exactly, repeats, no drift over 10 loops
+
+#### Step 5 — Loop Record + Playback (No AI)
+- State machine: IDLE → COUNTDOWN → RECORDING → PLAYING
+- PBF4 Button 1 triggers countdown; loop captured and plays back continuously
+- **Test**: Record 4-bar phrase → loops cleanly with no click at loop boundary
+
+#### Step 6 — Single Lyria WebSocket Connection
+- `LyriaBackend` connects, sends text prompt + params, streams back audio
+- **Test**: Send a static prompt "solo jazz piano at 120 BPM" → receive and play 8 seconds of audio
+
+#### Step 7 — First AI Instrument in the Loop
+- Send user loop audio to Lyria as audio prompt
+- After buffer pass, mix AI output with user loop in output callback
+- **Test**: Record loop → hear AI piano improvising over it after 2 passes
+
+#### Step 8 — Multi-Instance Cascade (4 AI voices)
+- Instantiate 2 `LyriaBackend` instances (default) + 2 optional (PBF4 Buttons 3/4)
+- Each instance receives cumulative mix of all prior voices
+- **Test**: Enable all 4 → confirm cascade timing (AI 1 at pass 3, AI 2 at pass 5, etc.)
+
+#### Step 9 — Genre Faders + Knob Parameters
+- Fader CC → `genre_weights` dict → `WeightedPrompts` rebuilt on every Lyria call
+- Knob CC → `guidance` / `density` → passed to Lyria params
+- **Test**: Move faders → hear style change after ~2 passes; confirm no crashes on rapid movement
+
+#### Step 10 — Re-Recording Mid-Session
+- PBF4 Button 1 during PLAYING → new countdown → new loop → atomic double-buffer swap
+- **Test**: Record loop → AI plays → record new loop → AI adapts → seamless
+
+#### Step 11 — Magenta RT Backend (Phase 2, swap only)
+- Implement `MagentaRTBackend` (HTTP + audio injection)
+- Change `config.yaml: ai_backend: "magenta_rt"` → everything else unchanged
+- **Test**: Identical session behavior as Lyria; different sound character
+
+#### Step 12 — Error Handling + Remote Access
+- Reconnection logic for Lyria WebSocket drops
+- SSH server + TightVNC configured on ThinkPad
+- Graceful `CTRL+C` shutdown: fades audio, closes connections, saves session log
 
 ---
 
@@ -1172,18 +1433,23 @@ Items marked ✓ are resolved. Items marked ✗ are still open.
 
 | # | Question | Status | Answer |
 |---|----------|--------|--------|
-| 1 | MiniLab 3 vs. MicroLab mk3? | ✓ RESOLVED | **MicroLab mk3** — 25 keys, 2 touch strips, 4 buttons, NO knobs/faders |
-| 2 | Does Analog Lab run standalone? | ✗ OPEN | Plugin-only confirmed. Use Ableton Live Lite as host, OR use Surge XT standalone |
-| 3 | ThinkPad GPU? | ✓ RESOLVED | **No discrete GPU** — cloud-only deployment required |
-| 4 | Audio routing method? | ✓ RESOLVED | **VB-Cable** (WASAPI shared mode, 48kHz, ~14–21ms latency) |
-| 5 | 4 parallel Magenta RT on free Colab? | ✓ RESOLVED | **Not feasible on one session** — see parallel instances strategy in Section 3 |
-| 6 | AI instruments continue during re-record? | → | **Yes** — AI instruments keep playing; user records new loop over them |
-| 7 | Minimum loop length? | → | CLI `--measures` arg; any integer ≥ 1 supported |
-| 8 | WSL2 or Windows native Python? | ✓ RESOLVED | **Windows native Python** (audio/MIDI simpler, no USB passthrough needed) |
-| 9 | Primary AI backend: Lyria or Magenta RT? | → | **Start with Lyria API** (simpler, free trial, truly parallel); **transition to Magenta RT** for audio injection in v2 |
-| 10 | PBF4 actual CC numbers? | ✗ OPEN | Must test hardware; update `config/pbf4_cc_map.json` |
-| 11 | Surge XT vs Analog Lab as synth? | ✗ OPEN | Surge XT recommended for prototype; Analog Lab for final |
-| 12 | Monitoring solution (hear own playing)? | ✗ OPEN | Voicemeeter Banana recommended; verify during audio setup phase |
+| 1 | MiniLab 3 vs. MicroLab mk3? | ✓ | **MicroLab mk3** confirmed — 25 keys, 2 touch strips, 4 buttons, NO knobs/faders |
+| 2 | Analog Lab standalone? | ✓ | Plugin-only. **Surge XT standalone** for prototype; Analog Lab + Ableton in v3 |
+| 3 | ThinkPad GPU? | ✓ | **No discrete GPU** — cloud-only inference |
+| 4 | Audio routing method? | ✓ | **VB-Cable** + WASAPI shared mode, 48kHz |
+| 5 | 4 parallel Magenta RT on free Colab? | ✓ | Not feasible on 1 session; use Lyria (Phase 1) or 4 separate Colabs (Phase 2) |
+| 6 | AI instruments continue during re-record? | ✓ | **Yes** — AI keeps playing, user records new loop over them |
+| 7 | Loop length minimum? | ✓ | CLI `--measures` flag, any int ≥ 1 |
+| 8 | WSL2 or Windows Python? | ✓ | **Windows native Python** |
+| 9 | Primary AI backend? | ✓ | **Phase 1: Lyria RealTime API** (free trial, parallel); **Phase 2: Magenta RT** (audio injection) |
+| 10 | Monitoring strategy? | ✓ | **Python PassthroughMonitor** — script plays back captured audio through speakers |
+| 11 | Prototype synth? | ✓ | **Surge XT standalone** — output to VB-Cable |
+| 12 | Google AI Studio account? | ✓ | joshuamiao03@gmail.com — verify Lyria RealTime API is enabled at https://aistudio.google.com/ |
+| 13 | GitHub repo? | ✓ | https://github.com/joshmiao1065/Generative_Musical_Improv_Loop |
+| 14 | **PBF4 actual CC numbers?** | ✗ OPEN | **Must test hardware before writing MIDI code** — plug in PBF4, run mido monitor, move every control, log CC numbers to `config/pbf4_cc_map.json` |
+| 15 | **Is Lyria RealTime Music API available on this Google account?** | ✗ OPEN | Lyria was in limited preview as of 2025; verify at https://aistudio.google.com/ — if not available, Lyria WebSocket approach may need adjustment |
+| 16 | Beat-alignment preference for AI output? | ✗ OPEN | Free improv (accept drift, simpler) vs. beat-locked (trimmed to loop boundary, harder)? |
+| 17 | How many genres must be specified? | ✗ OPEN | Can user provide 2 genres with 2 faders unused? Or always 4? |
 
 ---
 

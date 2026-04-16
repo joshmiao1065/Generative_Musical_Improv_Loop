@@ -1,0 +1,23 @@
+# requirements_server.txt
+# Dependencies for the Colab server (Magenta RT inference side).
+# Install via the INSTALL block in colab/poc_cascade.py — NOT via pip install directly,
+# because magenta-realtime and t5x must be installed from source with editable installs.
+#
+# Listed here for documentation and future packaging:
+
+# Core inference
+# magenta-realtime[tpu]   # from source: https://github.com/magenta/magenta-realtime
+# t5x[tpu]                # from source: https://github.com/google-research/t5x
+tf2jax==0.3.8
+
+# Audio processing
+librosa>=0.10.0
+soundfile>=0.12.1
+resampy>=0.4.3
+numpy>=1.26.0
+
+# FastAPI server (Phase B — not needed for Phase A POC)
+fastapi>=0.110.0
+uvicorn>=0.29.0
+pyngrok>=7.0.0
+python-multipart>=0.0.9    # for FastAPI file uploads

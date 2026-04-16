@@ -1,0 +1,84 @@
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+pip-wheel-metadata/
+.Python
+
+# ── Virtual environments ─────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env.local
+
+# ── Secrets / credentials ────────────────────────────────────────────────────
+# Never commit API keys, tokens, or passwords
+.env
+secrets.json
+config/secrets.json
+*.pem
+*.key
+ngrok.yml
+
+# ── Jupyter / Colab ──────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*/.ipynb_checkpoints/
+# Keep notebooks themselves in version control (do not ignore *.ipynb)
+
+# ── Audio files ──────────────────────────────────────────────────────────────
+# Ignore generated output audio; keep test fixtures in tests/fixtures/
+output/
+recordings/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.aac
+*.m4a
+# Exceptions: test fixtures and example loops committed intentionally
+!tests/fixtures/*.wav
+!tests/fixtures/*.mp3
+
+# ── Model weights / cache ────────────────────────────────────────────────────
+# Magenta RT downloads weights from HuggingFace — do not commit them
+*.ckpt
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.pkl
+.cache/
+huggingface/
+magenta-realtime/        # cloned during Colab install, not part of this repo
+t5x/                     # cloned during Colab install, not part of this repo
+
+# ── IDE / Editor ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ───────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ── Logs / profiling ─────────────────────────────────────────────────────────
+*.log
+*.prof
+logs/
+
+# ── ngrok ────────────────────────────────────────────────────────────────────
+# ngrok binary and tunnels are ephemeral; URLs change each session
+ngrok
+ngrok.exe

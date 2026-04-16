@@ -92,3 +92,84 @@
 ---
 
 *Add new entries below this line after each session.*
+
+---
+
+## 2026-04-15 — Prototype Synth: Surge XT, Not Analog Lab
+
+**Attempted**: N/A (decision documented)
+**Root cause**: Analog Lab Intro (bundled with MicroLab mk3) is a VST plugin, requires DAW host. Ableton Live Lite adds setup friction during prototyping.
+**Correct approach**: Use Surge XT standalone (https://surge-synthesizer.github.io/) for the prototype. Set its audio output to "CABLE Input" (VB-Cable). Python script captures from "CABLE Output". No DAW needed.
+**Watch for**: Surge XT configuration must be done manually before each session — ensure output device is set to VB-Cable, not system default speakers.
+
+---
+
+## 2026-04-15 — Monitoring: Python Passthrough, Not Voicemeeter
+
+**Attempted**: N/A (decision documented)
+**Root cause**: Voicemeeter adds setup overhead. Monitoring can be handled inside the Python output callback by mixing captured VB-Cable audio with AI output.
+**Correct approach**: `PassthroughMonitor` class reads from audio capture queue and writes to output device in the same sounddevice output callback as the AI mix. ~20–40ms roundtrip is acceptable.
+**Watch for**: The passthrough audio must be mixed at the same gain level as AI voices. If user loop is too loud vs. AI, add a configurable `monitor_gain` parameter.
+
+---
+
+## 2026-04-15 — Phase 1 Backend: Lyria API (Not Magenta RT)
+
+**Attempted**: N/A (decision documented)
+**Root cause**: Running 4 parallel Magenta RT instances on Colab free tier is infeasible. Lyria RealTime API is a genuine cloud service supporting 4 parallel WebSocket connections without any server infrastructure.
+**Correct approach**: Implement `LyriaBackend` first. Stub `MagentaRTBackend` with NotImplementedError. The `AIInstrumentBackend` abstraction means swapping them is a config change, not a rewrite.
+**Watch for**: Verify Lyria RealTime Music API (not just Gemini text) is available on the account at https://aistudio.google.com/ before writing any Lyria connection code.
+
+---
+
+## 2026-04-15 — Lyria RealTime API Cannot Accept Audio Input — Eliminated
+
+**Attempted**: Planned to use Lyria RealTime API as Phase 1 backend.
+**Result**: Lyria confirmed text-only. Official docs and developer guide both state: input types are `WeightedPrompt` (text) and `MusicGenerationConfig` (numerical params). No audio input of any kind.
+**Root cause**: Lyria is a generative model that produces music from style descriptions. It does not have an "audio continuation" or "audio injection" mode.
+**Correct approach**: Use **Magenta RT exclusively**. It is the only option with audio injection. Lyria is removed from this project entirely.
+**Watch for**: Do not revisit Lyria for any backend role in this project.
+
+---
+
+## 2026-04-15 — Temperature and Top-K ARE Real Magenta RT Parameters
+
+**Attempted**: Documented that temperature/topk were "not available" based on initial research.
+**Result**: Actual notebook source code shows both are real `generate_chunk()` kwargs.
+**Root cause**: Early research was based on the project README/paper, not the actual code.
+**Correct approach**: Map PBF4 knobs to: `guidance_weight`, `temperature`, `topk`, `model_feedback`. All four are real model parameters verified from source.
+**Watch for**: Always verify parameters by reading actual source code, not just docs.
+
+---
+
+## 2026-04-15 — Magenta RT Audio Injection: Exact Mechanism Documented
+
+**Attempted**: N/A (research session)
+**Root cause**: Needed to understand audio injection before designing the cascade.
+**Correct approach (verified from notebook source)**:
+1. Input audio (numpy, 48kHz stereo) is accumulated in `injection_state.all_inputs`
+2. A window of recent input is mixed with recent model output: `mix = input_window + output_window * model_feedback`
+3. Mix is encoded to SpectroStream tokens via `spectrostream_model.encode(mix_audio)`
+4. Tokens replace model context: `state.context_tokens[-N:] = mix_tokens`
+5. Both original and mixed contexts are passed to `generate_chunk()` (tied CFG)
+6. Output is 2s of 48kHz stereo audio
+**For cascade**: AI Instance N receives `sum(user_loop, ai_1_output, ..., ai_n-1_output)` as its injection input.
+**Watch for**: The `colab_utils.AudioStreamer` used in the notebook is Colab-specific. The core generation logic (encode → inject → generate_chunk) can be extracted and run independently without Colab UI.
+
+---
+
+## 2026-04-15 — AIVoice Output is Shorter than CHUNK_SAMPLES
+
+**Attempted**: N/A (design-time discovery)
+**Root cause**: `_AudioFade.__call__()` removes `fade_samples` from the right end of each chunk to enable crossfading. The output is `(CHUNK_SAMPLES - fade_samples, 2)`, not `(CHUNK_SAMPLES, 2)`.
+**Correct approach**: Use `pad_to_chunk()` helper in `poc_cascade.py` to zero-pad voice outputs back to CHUNK_SAMPLES before adding them to the cascade cumulative mix. This ensures each voice receives a consistent CHUNK_SAMPLES input.
+**Watch for**: Never assume voice output length equals input length. Always use `pad_to_chunk()` when building cumulative_input.
+
+---
+
+## 2026-04-15 — Model is Shared Across All Voices; SpectroStream Too
+
+**Attempted**: N/A (design-time decision)
+**Root cause**: Loading MagentaRTCFGTied takes 3–5 minutes and significant memory. Each voice does NOT need its own model instance.
+**Correct approach**: Load one `MagentaRTCFGTied` and one `SpectroStreamJAX`. Pass both to all `AIVoice()` constructors. State is isolated per-voice in `_InjectionState` and `MagentaRTState` — the model weights are stateless.
+**Watch for**: Do not instantiate a separate model per voice. One model, multiple stateful voice wrappers.
