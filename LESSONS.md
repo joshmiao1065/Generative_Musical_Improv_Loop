@@ -1,175 +1,78 @@
 # LESSONS.md — Improv Loop Project
 
-> **Purpose**: Document every mistake, surprise, and hard-won lesson during this project so future LLM sessions do not repeat the same errors.
-> **Rule**: Append an entry after every implementation session or significant discovery.
-> **Format**:
-> ```
-> ## YYYY-MM-DD — [Topic]
-> **Attempted**: What was tried.
-> **Result**: What happened.
-> **Root cause**: Why it happened.
-> **Correct approach**: What actually works.
-> **Watch for**: What to avoid going forward.
-> ```
+> Append an entry after every session. Format: Attempted / Result / Root cause / Correct approach / Watch for.
 
 ---
 
-## 2026-04-15 — Magenta RT is a Library, Not a Cloud API
+## Hardware
 
-**Attempted**: N/A (documented pre-emptively from research)
-**Result**: N/A
-**Root cause**: Magenta RT (github.com/magenta/magenta-realtime) is an open-source Python library designed to run on TPU or high-VRAM GPU. It has no hosted endpoint.
-**Correct approach**: Wrap Magenta RT in a FastAPI server deployed on Google Colab free TPU, exposed via pyngrok tunnel. The ThinkPad Python script calls this HTTP endpoint.
-**Watch for**: Never write code that makes HTTP requests to a "Magenta RT endpoint" without first confirming the FastAPI server is running and the ngrok URL is set in config.
+**MicroLab mk3 has NO knobs or faders.**
+It is musical input only (25 keys, 2 touch strips, 4 octave/nav buttons). ALL system parameter control (guidance, temperature, topk, model_feedback, genre weights, record/stop) is handled exclusively by the **intech PBF4**. Never map system params to MicroLab CC numbers.
 
----
+**Analog Lab Intro is plugin-only; use Surge XT standalone for prototype.**
+Surge XT → output to "CABLE Input" (VB-Cable) → Python captures from "CABLE Output". No DAW needed. Set Surge XT output device before every session (it may reset to system default).
 
-## 2026-04-15 — Temperature and Top-K Are Not Magenta RT / Lyria Parameters
-
-**Attempted**: N/A (documented pre-emptively)
-**Result**: N/A
-**Root cause**: Temperature and top-k are LLM token-sampling parameters. Magenta RT uses a different architecture (autoregressive audio transformer) with different exposed controls.
-**Correct approach**: Map PBF4 knobs to the REAL parameters: `guidance` [0–6], `density` [0–1], `brightness` [0–1], `bpm` [60–200].
-**Watch for**: Do not include temperature or top-k anywhere in API calls, UI, or documentation.
+**VB-Cable: WASAPI shared mode only.**
+ASIO with VB-Cable fails in python-sounddevice (GitHub issue #520, closed "not planned"). Use default sounddevice settings on "CABLE Output" InputStream. Never pass `extra_settings=WasapiSettings(exclusive=True)` — exclusive mode conflicts with other apps on the virtual device.
 
 ---
 
-## 2026-04-15 — MicroLab mk3 Has No Knobs or Faders
+## Magenta RT Model
 
-**Attempted**: N/A (documented pre-emptively)
-**Result**: N/A
-**Root cause**: The Arturia MicroLab mk3 is a minimal 25-key MIDI controller with only 2 touch strips and 4 buttons. It has NO rotary encoders, NO faders.
-**Correct approach**: MicroLab mk3 = musical performance input ONLY (plays notes into Analog Lab / Surge XT). ALL system parameter control (guidance, density, genre weights, record/stop) is handled by the intech PBF4, which is a separate device.
-**Watch for**: Never attempt to map system parameters to MicroLab mk3 CC numbers. The PBF4 is the only parameter controller.
+**Temperature and top-k ARE real Magenta RT parameters.**
+Early research (README/paper) suggested they didn't exist. Source code (`generate_chunk()` kwargs) confirms: `guidance_weight`, `temperature`, `topk`, `model_feedback` are all real. Map all four to PBF4 knobs.
 
----
+**AIVoice output is shorter than CHUNK_SAMPLES.**
+`_AudioFade.__call__()` removes `fade_samples` from the right end for crossfading. Output shape is `(CHUNK_SAMPLES - fade_samples, 2)`. Always zero-pad back to CHUNK_SAMPLES with `pad_to_chunk()` before adding to the cascade cumulative mix.
 
-## 2026-04-15 — Analog Lab Intro (Bundled) is Plugin-Only
+**Model weights are shared across voices; only state is per-voice.**
+`MagentaRTCFGTied` and `SpectroStreamJAX` each load once per container. `_InjectionState` and `MagentaRTState` are per-voice. On Modal: one container per voice IS the correct design because of GPU parallelism, not because each needs its own model copy.
 
-**Attempted**: N/A (documented pre-emptively)
-**Result**: N/A
-**Root cause**: Analog Lab Intro (bundled with MicroLab mk3) is a VST/AU/AAX plugin format only. It requires a DAW host.
-**Correct approach**: Two options:
-  1. Use Ableton Live Lite (also bundled) as DAW host for Analog Lab Intro
-  2. Use Surge XT standalone synthesizer (free, open source) — simpler for prototyping
-**Watch for**: Do not assume Analog Lab is a standalone app. Test which is actually installed before proceeding.
+**Audio injection mechanism (implemented in `src/magenta_backend.py`):**
+Input audio accumulates in `all_inputs`. A window of recent input + recent output × `model_feedback` is encoded to SpectroStream tokens and injected into the model's context. Cascade input for Voice N = `user_loop + voice_0_out + ... + voice_{N-1}_out`. Colab UI (`colab_utils.AudioStreamer`) is not needed — core logic is `encode → inject → generate_chunk`.
 
 ---
 
-## 2026-04-15 — VB-Cable: Use WASAPI Shared Mode, Not ASIO
+## GPU / Modal Deployment
 
-**Attempted**: N/A (documented from GitHub issue research)
-**Result**: ASIO driver loading fails with VB-Cable in Python sounddevice (GitHub issue #520, closed "not planned").
-**Root cause**: VB-Cable's ASIO driver is not compatible with how python-sounddevice loads ASIO.
-**Correct approach**: Use WASAPI shared mode (default in sounddevice). Do NOT pass `extra_settings=WasapiSettings(exclusive=True)` when recording from VB-Cable — exclusive mode conflicts with other apps using the virtual device simultaneously.
-**Watch for**: When opening a sounddevice InputStream on "CABLE Output", use default settings. If latency is an issue, reduce blocksize but keep WASAPI shared mode.
+**Magenta RT requires three mandatory patches for GPU.**
+Without `t5x_partitioning.py.patch`, the model crashes on GPU (calls TPU-only `bounds_from_last_device()`). All three patches are in `magenta-realtime/patch/`. T5X must be pinned to commit `7781d167` — patches fail on HEAD. Install order: patch `t5x/setup.py` → `pip install -e t5x` → `pip install jax[cuda12]` → `pip install magenta-realtime` → patch `t5x/partitioning.py` and `seqio/vocabularies.py`.
 
----
+**A10G is 13% too slow for real-time; A100-80GB is confirmed viable.**
+- A10G: RTF 0.873× (chunk takes 2.29s to generate 2.0s audio) — use for offline only
+- A100-80GB: RTF 1.431× (1.40s per 2.0s chunk). Single voice = 5.68s to generate 8s loop = 0.71× ✓
+- Threading on one GPU: 0.99× speedup — JAX serializes GPU calls. Useless.
+- **Architecture locked**: 1 A100 per voice, 3 containers in parallel. Wall time ≈ 5.68s vs 8s loop. 2.32s headroom.
 
-## 2026-04-15 — ThinkPad Has No Discrete GPU: Cloud-Only Deployment
+**`modal.parameter()` + `min_containers > 0` fails at deploy.**
+Error: "Parameterized Functions cannot have `min_containers > 0`". Correct: omit `min_containers` entirely (defaults to 0). Use `scaledown_window=600` to keep containers alive 10 min after last call. Before a session, call `ping_all()` to warm all 3 containers (triggers model load, ~3 min first time, instant after).
 
-**Attempted**: N/A (confirmed from user)
-**Result**: N/A
-**Root cause**: The ThinkPad running the final script has no discrete GPU, making local Magenta RT inference impossible (~20–40GB VRAM required).
-**Correct approach**: All AI inference must use cloud:
-  - **Phase 1 (prototype)**: Lyria RealTime API via Google AI Studio free trial (WebSocket, parallel, simple)
-  - **Phase 2**: Magenta RT on Colab free TPU + FastAPI + ngrok (for audio injection capability)
-**Watch for**: Network latency to cloud APIs adds variable delay. The buffer-pass architecture (one loop pass of "dead time" per instrument) is specifically designed to absorb this latency.
+**`buffer_containers=3` on a parameterized class burns the 10-GPU quota.**
+`buffer_containers=N` keeps N warm containers per parameterized class regardless of demand. With 3 voices × `buffer_containers=3` = 9 idle GPUs + overhead = quota exhausted. Solution: use no `buffer_containers`, rely on `scaledown_window` to keep containers warm during a session.
 
----
+**`modal.Cls.from_name()` — how to call deployed parameterized classes from the client:**
+```python
+VoiceServer = modal.Cls.from_name("magenta-rt-server", "VoiceServer")
+voice = VoiceServer(voice_index=0)
+result = await voice.generate_pass.remote.aio(...)  # async
+result = voice.generate_pass.remote(...)            # sync
+```
+Only works after `modal deploy`. Raises `NotFoundError` if app is not deployed. Run `python src/modal_client.py` to verify before a session.
 
-## 2026-04-15 — 4 Parallel Magenta RT Instances Not Feasible on One Colab Free Session
+**Modal image build: do NOT use `t5x[gpu]` extra — it pulls fasttext which fails.**
+`t5x[gpu]` triggers a C++17 fasttext build that breaks the image. Install `t5x` base (no extras) + `jax[cuda12]` separately. Magenta RT never uses fasttext.
 
-**Attempted**: N/A (assessed from architecture constraints)
-**Result**: N/A
-**Root cause**: Colab free tier provides one v2-8 TPU. Loading Magenta RT (800M params) consumes most of the memory. Running 4 truly parallel inference threads is likely OOM.
-**Correct approach**: Choose one:
-  A. 4 separate Colab notebooks (4 browser tabs), each with own ngrok URL — clunky but free
-  B. Lyria API (4 WebSocket connections, genuinely parallel) — use free trial credits
-  C. Sequential inference (1 Colab, 4 sequential calls per loop pass) — slower but simpler
-**Watch for**: Always test single-instance performance before assuming multi-instance works. Profile inference time on Colab before designing the multi-instance architecture.
-
----
-
-*Add new entries below this line after each session.*
+**`t5x.__file__` is None with editable installs — use absolute path for patches.**
+`pip install -e` sets `__file__ = None`. Don't try `python -c "import t5x; print(t5x.__file__)"` to find patch targets. Use the known clone path directly: `patch /t5x/t5x/partitioning.py`.
 
 ---
 
-## 2026-04-15 — Prototype Synth: Surge XT, Not Analog Lab
+## Architecture Decisions (locked)
 
-**Attempted**: N/A (decision documented)
-**Root cause**: Analog Lab Intro (bundled with MicroLab mk3) is a VST plugin, requires DAW host. Ableton Live Lite adds setup friction during prototyping.
-**Correct approach**: Use Surge XT standalone (https://surge-synthesizer.github.io/) for the prototype. Set its audio output to "CABLE Input" (VB-Cable). Python script captures from "CABLE Output". No DAW needed.
-**Watch for**: Surge XT configuration must be done manually before each session — ensure output device is set to VB-Cable, not system default speakers.
+**Lyria RealTime API eliminated.** Text-only input — no audio injection. Magenta RT is the sole AI backend.
 
----
+**Colab eliminated.** Session disconnects, no persistent URL. Replaced by Modal.com (persistent, callable, GPU-backed).
 
-## 2026-04-15 — Monitoring: Python Passthrough, Not Voicemeeter
+**One-pass lag is intentional.** In parallel dispatch, Voice N hears Voice N-1's *previous pass* output, not the current one. This is required by the buffer-pass architecture. Do not try to eliminate it.
 
-**Attempted**: N/A (decision documented)
-**Root cause**: Voicemeeter adds setup overhead. Monitoring can be handled inside the Python output callback by mixing captured VB-Cable audio with AI output.
-**Correct approach**: `PassthroughMonitor` class reads from audio capture queue and writes to output device in the same sounddevice output callback as the AI mix. ~20–40ms roundtrip is acceptable.
-**Watch for**: The passthrough audio must be mixed at the same gain level as AI voices. If user loop is too loud vs. AI, add a configurable `monitor_gain` parameter.
-
----
-
-## 2026-04-15 — Phase 1 Backend: Lyria API (Not Magenta RT)
-
-**Attempted**: N/A (decision documented)
-**Root cause**: Running 4 parallel Magenta RT instances on Colab free tier is infeasible. Lyria RealTime API is a genuine cloud service supporting 4 parallel WebSocket connections without any server infrastructure.
-**Correct approach**: Implement `LyriaBackend` first. Stub `MagentaRTBackend` with NotImplementedError. The `AIInstrumentBackend` abstraction means swapping them is a config change, not a rewrite.
-**Watch for**: Verify Lyria RealTime Music API (not just Gemini text) is available on the account at https://aistudio.google.com/ before writing any Lyria connection code.
-
----
-
-## 2026-04-15 — Lyria RealTime API Cannot Accept Audio Input — Eliminated
-
-**Attempted**: Planned to use Lyria RealTime API as Phase 1 backend.
-**Result**: Lyria confirmed text-only. Official docs and developer guide both state: input types are `WeightedPrompt` (text) and `MusicGenerationConfig` (numerical params). No audio input of any kind.
-**Root cause**: Lyria is a generative model that produces music from style descriptions. It does not have an "audio continuation" or "audio injection" mode.
-**Correct approach**: Use **Magenta RT exclusively**. It is the only option with audio injection. Lyria is removed from this project entirely.
-**Watch for**: Do not revisit Lyria for any backend role in this project.
-
----
-
-## 2026-04-15 — Temperature and Top-K ARE Real Magenta RT Parameters
-
-**Attempted**: Documented that temperature/topk were "not available" based on initial research.
-**Result**: Actual notebook source code shows both are real `generate_chunk()` kwargs.
-**Root cause**: Early research was based on the project README/paper, not the actual code.
-**Correct approach**: Map PBF4 knobs to: `guidance_weight`, `temperature`, `topk`, `model_feedback`. All four are real model parameters verified from source.
-**Watch for**: Always verify parameters by reading actual source code, not just docs.
-
----
-
-## 2026-04-15 — Magenta RT Audio Injection: Exact Mechanism Documented
-
-**Attempted**: N/A (research session)
-**Root cause**: Needed to understand audio injection before designing the cascade.
-**Correct approach (verified from notebook source)**:
-1. Input audio (numpy, 48kHz stereo) is accumulated in `injection_state.all_inputs`
-2. A window of recent input is mixed with recent model output: `mix = input_window + output_window * model_feedback`
-3. Mix is encoded to SpectroStream tokens via `spectrostream_model.encode(mix_audio)`
-4. Tokens replace model context: `state.context_tokens[-N:] = mix_tokens`
-5. Both original and mixed contexts are passed to `generate_chunk()` (tied CFG)
-6. Output is 2s of 48kHz stereo audio
-**For cascade**: AI Instance N receives `sum(user_loop, ai_1_output, ..., ai_n-1_output)` as its injection input.
-**Watch for**: The `colab_utils.AudioStreamer` used in the notebook is Colab-specific. The core generation logic (encode → inject → generate_chunk) can be extracted and run independently without Colab UI.
-
----
-
-## 2026-04-15 — AIVoice Output is Shorter than CHUNK_SAMPLES
-
-**Attempted**: N/A (design-time discovery)
-**Root cause**: `_AudioFade.__call__()` removes `fade_samples` from the right end of each chunk to enable crossfading. The output is `(CHUNK_SAMPLES - fade_samples, 2)`, not `(CHUNK_SAMPLES, 2)`.
-**Correct approach**: Use `pad_to_chunk()` helper in `poc_cascade.py` to zero-pad voice outputs back to CHUNK_SAMPLES before adding them to the cascade cumulative mix. This ensures each voice receives a consistent CHUNK_SAMPLES input.
-**Watch for**: Never assume voice output length equals input length. Always use `pad_to_chunk()` when building cumulative_input.
-
----
-
-## 2026-04-15 — Model is Shared Across All Voices; SpectroStream Too
-
-**Attempted**: N/A (design-time decision)
-**Root cause**: Loading MagentaRTCFGTied takes 3–5 minutes and significant memory. Each voice does NOT need its own model instance.
-**Correct approach**: Load one `MagentaRTCFGTied` and one `SpectroStreamJAX`. Pass both to all `AIVoice()` constructors. State is isolated per-voice in `_InjectionState` and `MagentaRTState` — the model weights are stateless.
-**Watch for**: Do not instantiate a separate model per voice. One model, multiple stateful voice wrappers.
+**Monitoring via Python passthrough.** sounddevice output callback mixes VB-Cable capture + AI outputs → speakers. ~20–40ms latency. No Voicemeeter needed for prototype.

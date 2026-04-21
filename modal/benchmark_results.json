@@ -1,0 +1,101 @@
+{
+  "gpu": "A100-80GB",
+  "jax_version": "0.10.0",
+  "jax_devices": "[CudaDevice(id=0)]",
+  "model_load_sec": 185.824588248,
+  "jit_warmup_times": [
+    20.44983678600005,
+    1.3763609290000431
+  ],
+  "test1_single_chunk": {
+    "chunk_secs": 2.0,
+    "times_sec": [
+      1.4350436759999639,
+      1.4388169039999639,
+      1.3495392780000088,
+      1.332497477000004,
+      1.4329305360000149
+    ],
+    "mean_sec": 1.397765574199991,
+    "std_sec": 0.04668435122785318,
+    "min_sec": 1.332497477000004,
+    "max_sec": 1.4388169039999639,
+    "real_time_factor": 1.4308550996791412,
+    "faster_than_rt": true
+  },
+  "test2_sequential_pass": {
+    "8 beats  @ 120 BPM (4.0s)": {
+      "loop_sec": 4.0,
+      "chunks_per_pass": 2,
+      "chunk_times_sec": [
+        1.3408428510000476,
+        1.4404898159999675
+      ],
+      "total_sec": 2.781344809000018,
+      "gen_loop_ratio": 0.6953362022500045,
+      "feasible": true
+    },
+    "16 beats @ 120 BPM (8.0s)": {
+      "loop_sec": 8.0,
+      "chunks_per_pass": 4,
+      "chunk_times_sec": [
+        1.4122494390000497,
+        1.398818570000003,
+        1.433847557999968,
+        1.4387203100000079
+      ],
+      "total_sec": 5.683649946000003,
+      "gen_loop_ratio": 0.7104562432500003,
+      "feasible": true
+    },
+    "8 beats  @  90 BPM (5.3s)": {
+      "loop_sec": 5.333333333333333,
+      "chunks_per_pass": 3,
+      "chunk_times_sec": [
+        1.4459882539999853,
+        1.340661864000026,
+        1.4592947339999682
+      ],
+      "total_sec": 4.245953063000002,
+      "gen_loop_ratio": 0.7961161993125003,
+      "feasible": true
+    }
+  },
+  "test3_cascade": {
+    "target": "16 beats @ 120 BPM (8.0s)",
+    "n_voices": 3,
+    "chunks_per_pass": 4,
+    "loop_sec": 8.0,
+    "total_audio_sec": 24.0,
+    "sequential": {
+      "total_sec": 16.639056969999956,
+      "gen_loop_ratio": 2.0798821212499945,
+      "feasible": false,
+      "per_voice_mean": [
+        1.3864882554999838,
+        1.382636254000019,
+        1.3889989539999874
+      ]
+    },
+    "threaded": {
+      "total_sec": 16.734219230999997,
+      "gen_loop_ratio": 2.0917774038749997,
+      "feasible": false,
+      "speedup_vs_seq": 0.9943133133559195
+    }
+  },
+  "test4_lookahead": {
+    "loop_sec": 8.0,
+    "chunks_per_pass": 4,
+    "n_passes": 3,
+    "pass_times_sec": [
+      5.720744116999981,
+      5.500265524999975,
+      5.5226204070000335
+    ],
+    "mean_pass_sec": 5.58121001633333,
+    "max_pass_sec": 5.720744116999981,
+    "gen_loop_ratio": 0.7150930146249976,
+    "sustainable_rt": true
+  }
+}
