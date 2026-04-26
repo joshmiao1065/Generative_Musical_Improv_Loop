@@ -158,6 +158,11 @@ class VoiceServer:
 
         self.voice = AIVoice(self.model, self.ss_model, style, self.params)
 
+        # Cache for genre style embeddings — populated lazily on first call per genre string.
+        # Keys are "{genre} {instrument}" prompts; values are StyleEmbedding objects.
+        # Avoids recomputing MusicCoCa forward pass every generation pass.
+        self._style_cache: dict = {}
+
         # JIT warm-up
         dummy = np.zeros((CHUNK_SAMPLES, 2), dtype=np.float32)
         self.voice.step(dummy)
@@ -176,6 +181,9 @@ class VoiceServer:
         temperature: float = 1.2,
         topk: int = 30,
         model_feedback: float = 0.95,
+        genres: list = None,
+        instrument: str = "piano",
+        genre_weights: list = None,
     ) -> bytes:
         """
         Generate one full loop pass for this voice.
@@ -189,12 +197,17 @@ class VoiceServer:
             bpm:              Tempo of the loop.
             guidance_weight / temperature / topk / model_feedback: generation params,
                               updated live from PBF4 knobs.
+            genres:           List of genre strings (e.g. ["jazz", "blues"]).
+            instrument:       Instrument name (e.g. "piano"). Combined with each genre.
+            genre_weights:    Per-genre blend weights [0.0–1.0]. Normalized internally.
+                              Embeddings are cached after first computation per genre.
 
         Returns:
             WAV bytes of this voice's generated audio for the full pass.
         """
         import soundfile as sf
         import librosa
+        from magenta_rt import musiccoca
 
         SR = self.SAMPLE_RATE
         CS = self.CHUNK_SAMPLES
@@ -218,13 +231,51 @@ class VoiceServer:
             out[:len(arr)] = arr
             return out
 
-        # Update params from knob values (enables live PBF4 control)
+        # Update params from knob values (enables live PBF4 / QWERTY control)
         self.params.guidance_weight = guidance_weight
         self.params.temperature     = temperature
         self.params.topk            = topk
         self.params.model_feedback  = model_feedback
         self.params.beats_per_loop  = beats_per_loop
         self.params.bpm             = bpm
+
+        # ── Genre blending ────────────────────────────────────────────────────
+        # Build a blended StyleEmbedding from the live per-genre weights.
+        # Embeddings are computed once per unique "{genre} {instrument}" prompt
+        # and cached in self._style_cache for the container's lifetime.
+        if genres and genre_weights:
+            # Filter to genres that have non-trivial weight and non-empty name
+            active = [
+                (g, w) for g, w in zip(genres, genre_weights)
+                if g and w > 1e-4
+            ]
+            if active:
+                active_genres, active_weights = zip(*active)
+                ws = np.array(active_weights, dtype=np.float64)
+                ws /= ws.sum()   # normalize so weights always sum to 1.0
+
+                embeddings = []
+                for g in active_genres:
+                    prompt = f"{g} {instrument}"
+                    if prompt not in self._style_cache:
+                        print(f"Voice {self.voice_index}: computing style embedding for '{prompt}'")
+                        self._style_cache[prompt] = self.model.embed_style(prompt)
+                    embeddings.append(self._style_cache[prompt])
+
+                if len(embeddings) == 1:
+                    blended = embeddings[0]
+                else:
+                    # Linear interpolation in embedding space, then wrap back into StyleEmbedding
+                    blended_vec = sum(
+                        float(w) * e.embedding for w, e in zip(ws, embeddings)
+                    )
+                    blended = musiccoca.StyleEmbedding(embedding=blended_vec)
+
+                self.voice.style_embedding = blended
+                blend_desc = " + ".join(
+                    f"{g}({w:.0%})" for g, w in zip(active_genres, ws)
+                )
+                print(f"Voice {self.voice_index}: style = {blend_desc} {instrument}")
 
         user_loop  = _load(user_loop_bytes)
         prior_mix  = _load(prior_mix_bytes)

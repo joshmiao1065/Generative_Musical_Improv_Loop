@@ -39,7 +39,7 @@ One-pass lag is intentional: each voice hears the *previous pass's* outputs.
 import asyncio
 import io
 import time
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
@@ -168,13 +168,17 @@ class MagentaRTClient:
         self,
         user_loop_np: np.ndarray,
         *,
-        # Live PBF4 knob values — pass current values each call
+        # Live PBF4 / QWERTY knob values — pass current values each call
         beats_per_loop: Optional[int] = None,
         bpm: Optional[int] = None,
         guidance_weight: Optional[float] = None,
         temperature: Optional[float] = None,
         topk: Optional[int] = None,
         model_feedback: Optional[float] = None,
+        # Genre blending — pass from session args + live fader weights
+        genres: Optional[List[str]] = None,
+        instrument: Optional[str] = None,
+        genre_weights: Optional[List[float]] = None,
     ) -> list[np.ndarray]:
         """
         Generate one full loop pass for all voices simultaneously.
@@ -201,7 +205,7 @@ class MagentaRTClient:
             Saves returned outputs as self._prev_outputs for the next call's
             prior_mix computation.
         """
-        # Update params if caller passed new values (from PBF4 MIDI thread)
+        # Update params if caller passed new values (from PBF4 / QWERTY thread)
         if beats_per_loop  is not None: self.beats_per_loop  = beats_per_loop
         if bpm             is not None: self.bpm             = bpm
         if guidance_weight is not None: self.guidance_weight = guidance_weight
@@ -237,6 +241,11 @@ class MagentaRTClient:
 
         prior_mix_bytes = [_np_to_wav_bytes(m) for m in prior_mixes]
 
+        # Resolve genre args — fall back to safe defaults if not provided
+        _genres        = genres        if genres        is not None else ["jazz", "piano solo"]
+        _instrument    = instrument    if instrument    is not None else "piano"
+        _genre_weights = genre_weights if genre_weights is not None else [1.0, 0.0, 0.0, 0.0]
+
         # Dispatch all voices in parallel
         t0 = time.perf_counter()
         tasks = [
@@ -249,6 +258,9 @@ class MagentaRTClient:
                 temperature=self.temperature,
                 topk=self.topk,
                 model_feedback=self.model_feedback,
+                genres=_genres,
+                instrument=_instrument,
+                genre_weights=_genre_weights,
             )
             for i in range(self.n_voices)
         ]

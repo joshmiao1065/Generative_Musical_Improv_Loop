@@ -5,6 +5,9 @@ Usage:
     python improv_loop.py --bpm 120 --beats 16
     python improv_loop.py --bpm 90 --beats 8 --voices 2
 
+    # QWERTY keyboard fallback when PBF4 is not connected:
+    python improv_loop.py --dry-run --qwerty
+
     # Debug without Modal (uses sine tones as AI placeholder):
     python improv_loop.py --dry-run
 
@@ -31,6 +34,9 @@ Usage:
     # Disable metronome click (silent count-in):
     python improv_loop.py --no-click
 
+    # Genre blending (style context passed to Modal each pass):
+    python improv_loop.py --genres "jazz" "blues" "electronic" "ambient" --instrument piano
+
 Controls (PBF4):
     Button 1  — record_toggle: first press starts count-in then records;
                 press while recording ends it early; press while playing restarts.
@@ -43,13 +49,22 @@ Controls (PBF4):
     Knob 3    — topk             [0–100]
     Knob 4    — model_feedback   [0–1]
 
+Controls (--qwerty fallback, when PBF4 not connected):
+    Space/Enter — record_toggle
+    1 / 2 / 3   — toggle AI Voice 1 / 2 / 3
+    q           — quit
+    + / -       — guidance_weight ±0.5
+    t / T       — temperature ±0.1   k / K — topk ±5   f / F — model_feedback ±0.05
+    ] / [       — genre 0 weight ±0.1   ' / ; — genre 1   . / , — genre 2   M/m — genre 3
+    ?           — print current params
+
 State machine:
-    IDLE → [Button 1] → COUNTDOWN
+    IDLE → [Button 1 / Space] → COUNTDOWN
     COUNTDOWN → [done] → RECORDING
     COUNTDOWN → [Button 1] → IDLE
     RECORDING → [loop elapsed OR Button 1] → PLAYING
     PLAYING → [Button 1] → COUNTDOWN  (AI voices continue uninterrupted)
-    PLAYING → [Ctrl-C] → STOPPING → IDLE
+    PLAYING → [Ctrl-C / q] → STOPPING → IDLE
 
 Synth routing (hardware — no code change needed when switching synths):
     Surge XT:    Preferences → Audio → Output: "CABLE Input"
@@ -62,11 +77,9 @@ import argparse
 import asyncio
 import dataclasses
 import logging
-import signal
 import sys
 import threading
 import time
-import types
 from enum import Enum, auto
 from pathlib import Path
 from typing import List, Optional
@@ -74,11 +87,12 @@ from typing import List, Optional
 import numpy as np
 
 # ── Project imports ───────────────────────────────────────────────────────────
-from src.audio_devices   import detect as detect_devices, list_devices, list_midi_ports
-from src.audio_mixer     import AudioMixer
-from src.loop_capture    import LoopCapture
-from src.midi_controller import PBF4Controller
-from src.timing_engine   import TimingEngine
+from src.audio_devices      import detect as detect_devices, list_devices, list_midi_ports
+from src.audio_mixer        import AudioMixer
+from src.loop_capture       import LoopCapture
+from src.midi_controller    import PBF4Controller
+from src.keyboard_controller import QwertyController
+from src.timing_engine      import TimingEngine
 
 # GenerationParams lives in magenta_backend but improv_loop doesn't need JAX.
 # Import it directly; if JAX isn't available on this machine, use the stub.
@@ -125,7 +139,7 @@ class ImprovSession:
         self.state   = State.IDLE
         self._lock   = threading.Lock()   # guards state transitions
 
-        # Shared generation params — written by MIDI thread, read by main loop
+        # Shared generation params — written by MIDI/QWERTY thread, read by main loop
         self.params = GenerationParams(
             bpm=args.bpm,
             beats_per_loop=args.beats,
@@ -134,6 +148,10 @@ class ImprovSession:
             topk=40,
             model_feedback=0.7,
         )
+
+        # Genre / style config (set once from CLI, weights updated live per pass)
+        self.genres:     List[str] = args.genres
+        self.instrument: str       = args.instrument
 
         # Current user loop audio (numpy array, set after first recording)
         self._user_loop: Optional[np.ndarray] = None
@@ -179,14 +197,22 @@ class ImprovSession:
         if not self.args.no_click:
             self.engine.set_click_output(self.mixer.play_oneshot)
 
-        self.ctrl = PBF4Controller(
-            self.params,
-            layout_path="config/pbf4_layout.json",
-        )
+        if self.args.qwerty:
+            self.ctrl = QwertyController(self.params)
+        else:
+            self.ctrl = PBF4Controller(
+                self.params,
+                layout_path="config/pbf4_layout.json",
+            )
+
         self.ctrl.on("record_toggle",  self._handle_record_toggle)
         self.ctrl.on("voice_1_toggle", lambda: self._handle_voice_toggle(0))
         self.ctrl.on("voice_2_toggle", lambda: self._handle_voice_toggle(1))
         self.ctrl.on("voice_3_toggle", lambda: self._handle_voice_toggle(2))
+
+        # QwertyController fires "quit"; PBF4Controller does not have this event
+        if hasattr(self.ctrl, "_callbacks") and "quit" in self.ctrl._callbacks:
+            self.ctrl.on("quit", self._handle_quit)
 
         if not self.args.dry_run:
             self.client = MagentaRTClient(
@@ -220,16 +246,24 @@ class ImprovSession:
     # ── Main loop ─────────────────────────────────────────────────────────────
 
     def run(self):
-        """Block until Ctrl-C or stop is called."""
-        # Install signal handler so Ctrl-C works even during asyncio or blocking calls
-        signal.signal(signal.SIGINT, self._handle_sigint)
+        """Block until Ctrl-C, q key (--qwerty), or stop is called.
 
+        Uses wait(timeout=0.1) instead of wait() — this releases the GIL every
+        100 ms so Python can raise KeyboardInterrupt from Ctrl-C on Windows.
+        A bare wait() blocks inside WaitForSingleObject and never wakes for SIGINT.
+        """
         self._print_banner()
-        self._stop_event.wait()
-        self._shutdown()
+        try:
+            while not self._stop_event.wait(timeout=0.1):
+                pass
+        except KeyboardInterrupt:
+            print("\n[Ctrl-C] Stopping session...")
+        finally:
+            self._shutdown()
 
-    def _handle_sigint(self, sig, frame):
-        print("\n[Ctrl-C] Stopping session...")
+    def _handle_quit(self):
+        """Called by QwertyController when q is pressed."""
+        print("\n[q] Stopping session...")
         self._stop_event.set()
 
     def _shutdown(self):
@@ -268,9 +302,11 @@ class ImprovSession:
         self.mixer.clear_voices()
         self._user_loop = None
         self._pass_number = 0
-        asyncio.run_coroutine_threadsafe(self.client.reset(), self._aio_loop)
+        if self.client is not None:
+            asyncio.run_coroutine_threadsafe(self.client.reset(), self._aio_loop)
+        hint = "Press Space to record a new loop." if self.args.qwerty else "Press Button 1 to record a new loop."
         self._transition(State.IDLE)
-        logger.info("[Session] Stopped. Press Button 1 to record a new loop.")
+        logger.info("[Session] Stopped. %s", hint)
 
     def _handle_voice_toggle(self, idx: int):
         label   = f"voice_{idx+1}_toggle"
@@ -371,6 +407,10 @@ class ImprovSession:
         """Dispatch one generation pass (Modal or dry-run) and queue results into mixer."""
         p = self.params
 
+        genre_weights = self.ctrl.get_genre_weights()
+        logger.debug("[Session] Pass %d genre weights: %s", pass_num,
+                     [f"{w:.2f}" for w in genre_weights])
+
         if self.args.dry_run:
             voice_outputs = self._dry_run_voices(user_loop)
             if self.args.dry_run_latency > 0:
@@ -387,6 +427,9 @@ class ImprovSession:
                     model_feedback=p.model_feedback,
                     beats_per_loop=self.args.beats,
                     bpm=self.args.bpm,
+                    genres=self.genres,
+                    instrument=self.instrument,
+                    genre_weights=genre_weights,
                 )
             except Exception as e:
                 logger.error("[Session] Modal generation error (pass %d): %s", pass_num, e)
@@ -450,24 +493,36 @@ class ImprovSession:
         logger.info("[Session] %s → %s", old.name, new_state.name)
 
     def _print_banner(self):
-        dry = "  *** DRY-RUN: Modal disabled, sine tones used ***" if self.args.dry_run else ""
+        dry    = "  *** DRY-RUN: Modal disabled, sine tones used ***" if self.args.dry_run else ""
+        qwerty = self.args.qwerty
+        ctrl   = "QWERTY keyboard" if qwerty else "PBF4"
+        rec    = "Space/Enter" if qwerty else "Button 1"
+        stop   = "q or Ctrl-C" if qwerty else "Ctrl-C"
+        genres_str = ", ".join(f"{g} ({w:.0%})" for g, w in
+                               zip(self.genres, self.ctrl.get_genre_weights()))
         print()
         print("=" * 62)
         print("  Improv Loop — Ready")
         print(f"  BPM: {self.args.bpm}  Beats: {self.args.beats}  Voices: {self.args.voices}")
+        print(f"  Controller: {ctrl}")
         print(f"  Capture:  [{self.devs.capture_idx}] {self.devs.capture_name}")
         print(f"  Playback: [{self.devs.playback_idx}] {self.devs.playback_name}")
+        print(f"  Instrument: {self.instrument}  Genres: {genres_str}")
         if dry:
             print(dry)
         print()
-        print("  [Button 1] Count-in → Record → Play → Re-record")
-        print("  [Button 2] Toggle AI Voice 1  (press to ENABLE — starts off)")
-        print("  [Button 3] Toggle AI Voice 2  (press to ENABLE — starts off)")
-        print("  [Button 4] Toggle AI Voice 3  (press to ENABLE — starts off)")
-        print("  [Ctrl-C]   Quit")
+        print(f"  [{rec}]  Count-in → Record → Play → Re-record")
+        if qwerty:
+            print("  [1 / 2 / 3]  Toggle AI Voice 1 / 2 / 3  (start DISABLED)")
+        else:
+            print("  [Button 2/3/4]  Toggle AI Voice 1/2/3  (start DISABLED)")
+        print(f"  [{stop}]  Quit")
         print("=" * 62)
         print()
-        print("  Waiting for Button 1 (PBF4 col-1 top)...")
+        if qwerty:
+            print(f"  Waiting for Space/Enter key (QWERTY mode)...")
+        else:
+            print("  Waiting for Button 1 (PBF4 col-1 top)...")
         print()
 
 
@@ -509,6 +564,22 @@ Examples:
     p.add_argument("--beats",  type=int, default=16,  help="Beats per loop (default: 16)")
     p.add_argument("--voices", type=int, default=3,   choices=[1, 2, 3],
                    help="Number of AI voices to use (default: 3)")
+    p.add_argument("--qwerty", action="store_true",
+                   help="Use QWERTY keyboard instead of PBF4. "
+                        "Space=record, 1/2/3=voices, q=quit, +/-=guidance, t/T=temp, "
+                        "k/K=topk, f/F=feedback, ]/[=genre0 ±0.1, etc. "
+                        "Named 'qwerty' to avoid confusion with the MIDI keyboard.")
+
+    # ── Style / genre blending ─────────────────────────────────────────────
+    style = p.add_argument_group("style / genre blending (passed to Modal each pass)")
+    style.add_argument("--genres", nargs="+", metavar="GENRE",
+                       default=["jazz", "blues", "electronic", "ambient"],
+                       help="Genre names for style blending. PBF4 faders (or --qwerty keys "
+                            "]/[, ;/', ./,, M/m) set the blend weight for each genre. "
+                            "Up to 4 genres. (default: jazz blues electronic ambient)")
+    style.add_argument("--instrument", default="piano", metavar="INSTR",
+                       help="Instrument name appended to each genre to form the style prompt "
+                            "(e.g. 'jazz piano'). (default: piano)")
 
     # ── Audio device routing ───────────────────────────────────────────────
     dev = p.add_argument_group("audio device routing")
@@ -554,6 +625,16 @@ def main():
         format="%(asctime)s.%(msecs)03d  %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Silently cap genres to 4 (PBF4 has 4 faders; QWERTY has 4 genre-weight pairs)
+    if len(args.genres) > 4:
+        logging.getLogger(__name__).warning(
+            "[CLI] More than 4 genres specified; only the first 4 will be used."
+        )
+        args.genres = args.genres[:4]
+    # Pad genre weights to exactly 4 slots so get_genre_weights() always returns 4 values
+    while len(args.genres) < 4:
+        args.genres.append("")   # empty string = zero-weight genre (never blended)
 
     # --list-devices: print device tables and exit (no session started)
     if args.list_devices:
