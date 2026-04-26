@@ -15,6 +15,9 @@ Surge XT → output to "CABLE Input" (VB-Cable) → Python captures from "CABLE 
 **VB-Cable: WASAPI shared mode only.**
 ASIO with VB-Cable fails in python-sounddevice (GitHub issue #520, closed "not planned"). Use default sounddevice settings on "CABLE Output" InputStream. Never pass `extra_settings=WasapiSettings(exclusive=True)` — exclusive mode conflicts with other apps on the virtual device.
 
+**Analog Lab Intro has a standalone application mode** (corrects earlier entry saying "plugin-only").
+Standalone mode: open Analog Lab → hamburger menu → Settings → Audio/MIDI → set Audio Device Type: WASAPI, Output Device: "CABLE Input (VB-Audio Virtual Cable)", Sample Rate: 48000, Buffer Size: 512. Set MIDI Input: "MicroLab mk3". No DAW needed. If Analog Lab only shows ASIO devices, install ASIO4ALL or use the plugin version in a DAW. Python code is unchanged — it always captures from CABLE Output regardless of which synth is upstream.
+
 ---
 
 ## Magenta RT Model
@@ -79,34 +82,53 @@ Only works after `modal deploy`. Raises `NotFoundError` if app is not deployed. 
 
 ---
 
-## Audio Devices (Session 7 — 2026-04-21)
+## Audio Devices
 
-**MIDI devices detected on Windows:** `['MicroLab mk3 0', 'Intech Grid MIDI device 1']`
-Both are present and accessible via `mido` on Windows Python. WSL2 cannot see USB
-MIDI/audio devices — always run these scripts with the Windows `.venv` Python.
+**MIDI devices detected on Windows (confirmed 2026-04-21):** `['MicroLab mk3 0', 'Intech Grid MIDI device 1']`
+Both are accessible via `mido` on Windows Python. WSL2 cannot see USB MIDI/audio
+devices — always run MIDI/audio scripts with the Windows `.venv` Python.
 
-**VB-Cable is NOT installed.** Not present in `sd.query_devices()` on 2026-04-21.
+**VB-Cable installed (confirmed 2026-04-26).** Detected as device [2] "CABLE Output
+(VB-Audio Virtual Cable)" at 48kHz stereo. Auto-detection in `audio_devices.py`
+prefers it over Stereo Mix. Use `--capture-device "CABLE Output"` to be explicit.
+Stereo Mix remains present (device 13) as a fallback.
 
-**Stereo Mix (device 13) IS present and capturing.** At 48kHz stereo, it matches the
-pipeline format. RMS=0.0018, Peak=0.022 in a quick background test while Surge was
-presumably idle/quiet. Works as a capture device BUT has the feedback problem (see
-`docs/vb_cable_analysis.md`): Python AI output → speakers → Stereo Mix → Modal →
-creates uncontrolled audio feedback loop. For initial testing only.
+**VB-Cable signal chain:**
+```
+Surge XT / Analog Lab → audio out → "CABLE Input" (set in synth audio settings)
+    → VB-Cable kernel driver
+    → "CABLE Output" → Python InputStream (device [2], 48kHz stereo float32)
+    → LoopCapture ring buffer → Modal → AI audio
+    → Python OutputStream → Speakers (device [15], Realtek)
+```
+Python's speaker output is completely isolated from CABLE Output. There is no
+feedback path. This is why VB-Cable is required for production sessions.
 
-**Stereo Mix must be enabled in Windows Sound Settings** before use:
-Sound Settings → Recording → Stereo Mix → right-click → Enable.
+**VB-Cable sample rate must be 48kHz in Windows Sound Settings — one-time setup.**
+Right-click speaker icon → Sound Settings → More sound settings:
+- Recording tab → CABLE Output → Properties → Advanced → 2ch 24-bit 48000 Hz
+- Playback tab → CABLE Input → Properties → Advanced → 2ch 24-bit 48000 Hz
+If left at 44.1kHz (Windows default), sounddevice silently resamples → pitch shift
+in the captured audio. The loop will sound correct but AI generation will be misaligned.
 
-**VB-Cable recommendation: buy it ($5).** Stereo Mix works for testing (no feedback
-if AI output is muted), but VB-Cable is required for production sessions. CABLE Output
-(input side) will appear at 48kHz stereo, same format — minimal code change required.
+**Surge XT forgets its audio output device between sessions.** Check Preferences →
+Audio → Output Device = "CABLE Input" at the start of every session. It often resets
+to the system default speakers on close.
 
-**pyaudiowpatch is a free WASAPI loopback alternative.** Can open a specific output
-device (Surge's output) as a loopback input, avoiding the feedback problem without
-VB-Cable. More complex setup. Not tested yet.
+**Stereo Mix feedback loop (without VB-Cable):** Python AI output → Speakers →
+Stereo Mix → LoopCapture ring buffer → user_loop sent to Modal → model generates
+against its own previous output. Quality degrades each pass. For testing without
+VB-Cable: mute Python output or use `--dry-run` (which doesn't send to Modal anyway).
 
 **CC discovery: use `scripts/discover_cc.py` on Windows Python.** Run in a terminal,
 move every PBF4 control, Ctrl+C. Results → `config/pbf4_cc_map.json`. WSL Python
 cannot open ALSA sequencer — must use Windows venv.
+
+**`config/pbf4_cc_map.json` has empty `cc_controls` as of 2026-04-26.** Knobs and
+faders were never moved during discovery — only buttons were pressed. CC numbers
+in `pbf4_layout.json` (CC 32-35 for knobs, CC 36-39 for faders) are unverified
+guesses. If knobs/faders appear to do nothing, this is why. Re-run `discover_cc.py`
+with all controls moved before relying on them.
 
 ---
 
@@ -151,3 +173,70 @@ the discovered CC numbers match the layout file.
 - `--save-loops ./debug_loops`: save each captured loop to WAV
 - `--no-click`: silent count-in
 - `--log-level debug`: full trace logging
+
+---
+
+## VB-Cable Debugging Reference (Session 8 — 2026-04-26)
+
+These are the definitive failure modes and fixes for the VB-Cable capture chain.
+Check these before assuming a bug in Python code.
+
+**Symptom: loop WAV saved via `--save-loops` is silent (flat line)**
+Cause checklist:
+1. Surge XT / Analog Lab audio output is still pointing at system speakers, not "CABLE Input"
+2. VB-Cable sample rate mismatch — CABLE Output set to 44.1kHz in Windows Sound Settings
+3. No synth is running / no MIDI notes playing — silence is correct behaviour
+4. CABLE Output is set as Default Communication Device — some apps reroute it
+Fix: confirm Surge XT → Preferences → Audio → Output = "CABLE Input". Run
+`src/loop_capture.py` standalone to capture 4s and check RMS independently.
+
+**Symptom: captured audio has wrong pitch (chipmunk = too fast, slow-mo = too slow)**
+Cause: VB-Cable device sample rate in Windows Sound Settings doesn't match the 48kHz
+Python opens the InputStream at. The driver resamples transparently but wrongly.
+Fix: Sound Settings → Recording → CABLE Output → Properties → Advanced → set to
+"2 channel, 24 bit, 48000 Hz (Studio Quality)". Do the same for CABLE Input.
+
+**Symptom: you hear your synth directly but Python loop playback is silent**
+Cause: Surge XT is outputting to speakers AND CABLE Input simultaneously, or Python's
+OutputStream opened on the wrong device.
+Check: `--list-devices` output → confirm playback device is Speakers [15], not CABLE.
+Note: `_find_playback()` deliberately avoids selecting CABLE Input as playback.
+
+**Symptom: you hear the metronome click but not your own playing in the loop**
+Cause: capture is returning silence (see above) but the mixer is working. The click
+fires through `play_oneshot()` independent of loop audio.
+Fix: same as "loop WAV is silent" above.
+
+**Symptom: AI sine tones (dry-run) audible on pass 2+, but no user audio in the mix**
+Cause: VB-Cable capture is working but the synth isn't routed to it. The ring buffer
+fills with silence; `mixer.set_loop(silence_array)` plays nothing. AI tones play
+because they're generated independently from the (silent) user_loop.
+Fix: route synth to CABLE Input.
+
+**Symptom: echo / doubling of the synth**
+Cause: synth is outputting to both CABLE Input (captured by Python) AND speakers
+(direct monitoring). Python then plays the loop back through speakers. Two copies.
+Fix: in Surge XT, set output to CABLE Input only. Use Python as the sole monitoring
+path. There will be ~10–20ms latency from Python's output blocksize (512/48000).
+
+**Symptom: AI voices don't play even after pressing Button 2**
+When VB-Cable and PBF4 are both present: use `--log-level debug`. Confirm you see:
+```
+[Session] Pass 2: Voice 1 queued (8.00s, enabled=True)
+[AudioMixer] Voice 0 swapped in at boundary
+```
+If `enabled=False` appears: the button press is not reaching `set_voice_enabled`.
+Check PBF4 is connected and note_number 41 matches Button 2 in `pbf4_layout.json`.
+If no "queued" log appears: generation is failing silently — check Modal deploy status.
+
+**Symptom: `--list-devices` shows VB-Cable at wrong sample rate**
+The `Rate` column in `--list-devices` output shows the device's default_samplerate
+as reported by the driver. If it shows 44100, fix it in Windows Sound Settings before
+starting a session. Python will try to open at 48000 and may fail or resample.
+
+**Confirmed working configuration (2026-04-26):**
+- VB-Cable: device [2], 48kHz stereo, WASAPI shared mode
+- Speakers (Realtek): device [15], 48kHz stereo, WASAPI
+- No MIDI devices present during this test (PBF4 / MicroLab not connected)
+- `--dry-run --capture-device "CABLE Output"` launched successfully
+- Session flow confirmed: devices detected → layout loaded → streams started → ready
