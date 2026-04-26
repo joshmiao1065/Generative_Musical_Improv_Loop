@@ -1,0 +1,43 @@
+{
+  "Intech Grid MIDI device 0": {
+    "cc_controls": {},
+    "note_buttons": {
+      "ch0_note40": {
+        "channel": 0,
+        "note": 40,
+        "velocities_seen": [
+          0,
+          127
+        ],
+        "label": "record_toggle"
+      },
+      "ch0_note41": {
+        "channel": 0,
+        "note": 41,
+        "velocities_seen": [
+          0,
+          127
+        ],
+        "label": "voice_1_toggle"
+      },
+      "ch0_note42": {
+        "channel": 0,
+        "note": 42,
+        "velocities_seen": [
+          0,
+          127
+        ],
+        "label": "voice_2_toggle"
+      },
+      "ch0_note43": {
+        "channel": 0,
+        "note": 43,
+        "velocities_seen": [
+          0,
+          127
+        ],
+        "label": "voice_3_toggle"
+      }
+    }
+  }
+}

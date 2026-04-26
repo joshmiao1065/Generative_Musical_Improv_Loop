@@ -3,7 +3,7 @@
 > **Project**: Cooper Union — Generative Machine Learning, Final Project
 > **Developer**: Josh Miao
 > **GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop
-> **Last Updated**: 2026-04-20 (Session 6 — Modal deployed, client written, docs compacted)
+> **Last Updated**: 2026-04-26 (Session 8 — voice enable/disable inversion fixed, shape mismatch fixed, debug flags added, Analog Lab routing documented)
 
 ---
 
@@ -14,6 +14,9 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 2. Using `min_containers` on parameterized Modal classes — use `scaledown_window` instead (LESSONS.md)
 3. Writing MIDI CC numbers before testing physical PBF4 hardware (Section 2)
 4. Not calling `ping_all()` before a session — containers need ~3 min to warm on first use
+5. `AudioMixer._voice_enabled` starts `[False, False, False]` — voices must be explicitly enabled via Button 2/3/4
+6. Voice audio is trim/pad-corrected at each loop boundary — the strict shape check was a bug (now fixed)
+7. `pbf4_cc_map.json` has empty `cc_controls` — CC numbers were manually entered, must be verified with hardware
 
 ---
 
@@ -49,13 +52,23 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 | 3 | Enable AI Voice 3 | Genre 3 weight | `topk` [0–1024] |
 | 4 | Enable AI Voice 4 | Genre 4 weight | `model_feedback` [0–1] |
 
-**⚠ CC NUMBERS UNKNOWN — MUST TEST HARDWARE BEFORE CODING MIDI:**
-```bash
-python -c "import mido; print(mido.get_input_names())"
-python -c "import mido; port = mido.open_input(); [print(m) for m in port]"
-# Move every knob/fader/button, log CC numbers to config/pbf4_cc_map.json
+**⚠ CC NUMBERS ENTERED MANUALLY — MUST VERIFY WITH HARDWARE:**
+`config/pbf4_cc_map.json` has empty `cc_controls` — only buttons were captured during
+the initial discovery run. Knobs and faders were not moved. The CC numbers in
+`pbf4_layout.json` (CC 32-35 for knobs, CC 36-39 for faders) are manually entered
+guesses. Verify them with hardware before relying on knob/fader control.
+```bat
+REM Run from project root in a Windows terminal (NOT WSL):
+.venv\Scripts\python scripts\discover_cc.py
+REM Move EVERY knob and fader through their full range, press every button
+REM → config/pbf4_cc_map.json (check that cc_controls is now non-empty)
+REM Then verify the CC numbers match pbf4_layout.json
+.venv\Scripts\python scripts\validate_pbf4.py   REM live param readout
 ```
 Buttons send CC 127 (press) and 0 (release). CC numbers configurable in intech Grid Editor (LUA). USB class-compliant — no driver needed on Windows.
+
+**CONFIRMED:** MIDI port name is `'Intech Grid MIDI device 1'` (detected 2026-04-21).
+**IMPORTANT:** Must run all MIDI/audio scripts with Windows Python (`.venv\Scripts\python`), NOT WSL — USB devices are not visible from WSL2.
 
 Docs: https://docs.intech.studio/ | Grid Editor: https://docs.intech.studio/guides/grid/grid-adv/editor-201/
 
@@ -67,7 +80,7 @@ Docs: https://docs.intech.studio/ | Grid Editor: https://docs.intech.studio/guid
 
 **Deployment (confirmed working):**
 ```
-modal deploy modal/magenta_server.py      # deploy (one-time)
+modal deploy server/magenta_server.py      # deploy (one-time)
 python src/modal_client.py                # verify containers alive
 modal app stop magenta-rt-server          # stop billing when not playing
 ```
@@ -115,11 +128,24 @@ Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream 
 1. Install: https://shop.vb-audio.com/en/win-apps/11-vb-cable.html
 2. Sound Settings → CABLE Input + CABLE Output → both set to 48kHz, 24-bit
 3. Surge XT → Preferences → Audio → Output: "CABLE Input"
+   **OR** Analog Lab → Settings → Audio → Output device: "CABLE Input"
 4. Never use WASAPI exclusive mode with VB-Cable (sounddevice GH#520 — fails)
+5. After installation, launch with: `python improv_loop.py --capture-device "CABLE Output"`
+   (auto-detection prefers VB-Cable if present — this flag makes it explicit)
+
+**Synth switching** (no code changes needed — only hardware routing changes):
+- **Surge XT**: Preferences → Audio → Output: "CABLE Input"
+- **Analog Lab Intro (standalone)**: Settings → Audio → Output: "CABLE Input"; MIDI Input: "MicroLab mk3"
+- **Any DAW**: Master output → "CABLE Input" in DAW audio settings
+- Python always captures from "CABLE Output" (auto-detected) or specify: `--capture-device "CABLE Output"`
 
 **Monitoring**: Python output callback mixes VB-Cable capture + AI outputs → speakers. ~20–40ms passthrough latency. No Voicemeeter needed.
 
 **Audio format**: All internal audio is `(N, 2) float32 @ 48000 Hz`. WAV bytes over Modal are 24-bit PCM.
+
+**Without VB-Cable (Stereo Mix fallback)**: Works for initial testing, but captures ALL speaker
+audio. AI voice output bleeds back into the capture stream → fed to Modal → model responds to
+its own output. Quality degrades over time. For testing only — do not use in production sessions.
 
 ---
 
@@ -127,31 +153,46 @@ Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream 
 
 ```
 improv_loop/
-├── improv_loop.py              # ← NOT YET BUILT — main orchestrator
+├── improv_loop.py              # ✓ main orchestrator — all session logic, debug flags
 ├── config/
-│   └── pbf4_cc_map.json        # ← NOT YET BUILT — discover CC numbers first
+│   ├── pbf4_layout_template.json  # ✓ layout template with all 12 control labels
+│   ├── pbf4_layout.json           # ✓ CC numbers filled in (manually — verify with hardware!)
+│   └── pbf4_cc_map.json           # ← auto-generated by scripts/discover_cc.py
+│                                  #   WARNING: cc_controls is empty — knobs/faders not yet discovered
 ├── src/
 │   ├── magenta_backend.py      # ✓ AIVoice, MagentaRTCFGTied, GenerationParams
-│   └── modal_client.py         # ✓ MagentaRTClient — async parallel voice dispatch
-├── modal/
-│   ├── magenta_server.py       # ✓ VoiceServer — deployed on Modal A100
-│   ├── generate_cascade.py     # ✓ offline batch generation (tested, works)
-│   ├── benchmark_magenta.py    # ✓ A100 benchmark (RTF 1.431× confirmed)
-│   └── benchmark_results.json  # ✓ benchmark data
-├── colab/
-│   └── poc_cascade.py          # ✓ proof of concept (Colab sequential cascade)
+│   ├── modal_client.py         # ✓ MagentaRTClient — async parallel voice dispatch
+│   ├── midi_controller.py      # ✓ PBF4Controller — CC→GenerationParams, button callbacks
+│   ├── audio_mixer.py          # ✓ AudioMixer — voice enable/disable + shape trim/pad fixed
+│   ├── audio_devices.py        # ✓ device auto-detect + list_devices() + VB-Cable helper
+│   ├── loop_capture.py         # ✓ ring buffer capture with beat-aligned snapshot
+│   └── timing_engine.py        # ✓ perf_counter pass-boundary clock + metronome
+├── server/
+│   └── magenta_server.py       # ✓ VoiceServer — deployed on Modal A100
+├── scripts/
+│   ├── discover_cc.py          # ✓ interactive CC discovery → pbf4_cc_map.json
+│   ├── prime_server.py         # ✓ warm up deployed Modal containers
+│   ├── test_audio_logic.py     # ✓ unit tests (runs in WSL, no hardware required)
+│   └── validate_pbf4.py        # ✓ live param readout — run after filling pbf4_layout.json
 ├── CLAUDE.md                   # this file
 └── LESSONS.md                  # bugs and lessons — READ BEFORE CODING
 ```
 
-**Remaining to build** (in order):
-1. `src/audio_devices.py` — detect CABLE Output and output device indices
-2. `src/loop_capture.py` — sounddevice InputStream, ring buffer, snapshot to numpy on command
-3. `src/audio_mixer.py` — sounddevice OutputStream callback, mixes loop + voice queues
-4. `config/pbf4_cc_map.json` — discover with hardware, do NOT guess
-5. `src/midi_controller.py` — mido callback, CC→GenerationParams dispatch
-6. `src/timing_engine.py` — absolute-time loop clock (time.perf_counter), pass boundary callbacks
-7. `improv_loop.py` — wires everything: state machine + client + mixer + MIDI + timing
+**All core components built and tested.** Ready for end-to-end hardware testing.
+
+**To run a session:**
+```bat
+REM Test audio pipeline first (no Modal credits spent):
+.venv\Scripts\python improv_loop.py --dry-run
+
+REM List devices to confirm VB-Cable and PBF4 are visible:
+.venv\Scripts\python improv_loop.py --list-devices
+
+REM Real session with Modal:
+modal deploy server/magenta_server.py   # one-time deploy (already done)
+.venv\Scripts\python improv_loop.py --bpm 120 --beats 16
+```
+Then press Button 1 on the PBF4 to start. Press Buttons 2/3/4 to enable AI voices.
 
 ---
 
@@ -210,10 +251,11 @@ Genre list and instrument list configurable at CLI: `--genres "jazz" "blues" --i
 
 | # | Question | Status |
 |---|----------|--------|
-| 1 | PBF4 actual CC numbers? | **⚠ OPEN** — test hardware first |
+| 1 | PBF4 actual CC numbers for knobs/faders? | **⚠ OPEN** — `cc_controls` in pbf4_cc_map.json is empty; re-run discover_cc.py and move all knobs/faders |
 | 2 | Beat-alignment preference? | **⚠ OPEN** — free improv (accept drift) vs beat-locked (trim to boundary)? |
 | 3 | How many genres must be specified? | **⚠ OPEN** — 2 genres with 2 faders unused OK? |
-| 4 | Analog Lab / Ableton for final version? | Open — Surge XT confirmed for prototype |
+| 4 | Analog Lab routing confirmed? | **⚠ OPEN** — documented (standalone → CABLE Input) but not yet tested; Surge XT is confirmed working |
+| 5 | VB-Cable installed? | **⚠ OPEN** — user purchasing; code is ready (`--capture-device "CABLE Output"`) |
 
 ---
 
@@ -245,4 +287,4 @@ soundfile>=0.12.0
 modal>=0.73.0
 ```
 
-**Modal containers**: All server dependencies baked into the image at `modal deploy` time. See `modal/magenta_server.py` for the full image definition.
+**Modal containers**: All server dependencies baked into the image at `modal deploy` time. See `server/magenta_server.py` for the full image definition.

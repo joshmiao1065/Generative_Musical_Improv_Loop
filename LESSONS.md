@@ -76,3 +76,78 @@ Only works after `modal deploy`. Raises `NotFoundError` if app is not deployed. 
 **One-pass lag is intentional.** In parallel dispatch, Voice N hears Voice N-1's *previous pass* output, not the current one. This is required by the buffer-pass architecture. Do not try to eliminate it.
 
 **Monitoring via Python passthrough.** sounddevice output callback mixes VB-Cable capture + AI outputs → speakers. ~20–40ms latency. No Voicemeeter needed for prototype.
+
+---
+
+## Audio Devices (Session 7 — 2026-04-21)
+
+**MIDI devices detected on Windows:** `['MicroLab mk3 0', 'Intech Grid MIDI device 1']`
+Both are present and accessible via `mido` on Windows Python. WSL2 cannot see USB
+MIDI/audio devices — always run these scripts with the Windows `.venv` Python.
+
+**VB-Cable is NOT installed.** Not present in `sd.query_devices()` on 2026-04-21.
+
+**Stereo Mix (device 13) IS present and capturing.** At 48kHz stereo, it matches the
+pipeline format. RMS=0.0018, Peak=0.022 in a quick background test while Surge was
+presumably idle/quiet. Works as a capture device BUT has the feedback problem (see
+`docs/vb_cable_analysis.md`): Python AI output → speakers → Stereo Mix → Modal →
+creates uncontrolled audio feedback loop. For initial testing only.
+
+**Stereo Mix must be enabled in Windows Sound Settings** before use:
+Sound Settings → Recording → Stereo Mix → right-click → Enable.
+
+**VB-Cable recommendation: buy it ($5).** Stereo Mix works for testing (no feedback
+if AI output is muted), but VB-Cable is required for production sessions. CABLE Output
+(input side) will appear at 48kHz stereo, same format — minimal code change required.
+
+**pyaudiowpatch is a free WASAPI loopback alternative.** Can open a specific output
+device (Surge's output) as a loopback input, avoiding the feedback problem without
+VB-Cable. More complex setup. Not tested yet.
+
+**CC discovery: use `scripts/discover_cc.py` on Windows Python.** Run in a terminal,
+move every PBF4 control, Ctrl+C. Results → `config/pbf4_cc_map.json`. WSL Python
+cannot open ALSA sequencer — must use Windows venv.
+
+---
+
+## Audio Output Bugs Fixed (Session 8 — 2026-04-26)
+
+**Voice enable/disable was inverted — the most likely cause of "no AI audio."**
+`AudioMixer._voice_enabled` was initialised `[True, True, True]`, but the PBF4
+toggle state starts `False`. The first button press was a no-op (set True, already
+True). The second press disabled the voice. Voices actually auto-played without any
+button press (after pass 2), which is why it "worked without knowing how."
+Fix: initialise `_voice_enabled = [False, False, False]`. First button press now
+correctly enables; second disables.
+
+**Voice audio was silently dropped on length mismatch (non-120 BPM / 16-beat sessions).**
+`_audio_callback` had `if va.shape[0] != loop_len: continue` with no log. This
+silently suppressed AI voices at any BPM/beat count where the generated audio length
+(= `chunks_per_pass × CHUNK_SAMPLES`) didn't exactly equal the user loop length.
+At 120 BPM / 16 beats both are 384,000 samples so it worked; at 90 BPM / 8 beats
+the loop is 256,000 but generated audio is 288,000 — silently dropped.
+Fix: trim or zero-pad incoming audio to loop_len inside `_on_boundary()` before
+assigning to `_voice_audio[i]`. The length check in `_audio_callback` now logs a
+warning instead of silently continuing.
+
+**Analog Lab Intro has a standalone application mode.** Previous LESSONS entry
+said "plugin-only." This is incorrect. Analog Lab Intro ships as a standalone app
+and as a VST/AU plugin. Standalone mode: open Analog Lab, set Audio Output → CABLE
+Input, set MIDI Input → MicroLab mk3. No DAW needed. Python code is unchanged —
+it captures from whatever is routed to CABLE Output.
+
+**`config/pbf4_cc_map.json` has empty `cc_controls`.** The knobs and faders were
+never moved during `discover_cc.py` — only buttons were pressed. CC numbers in
+`pbf4_layout.json` (32–39) were entered manually. Run `scripts/discover_cc.py` again
+on Windows Python, move every knob and fader slowly through full range, then verify
+the discovered CC numbers match the layout file.
+
+**Debugging flags added to `improv_loop.py`.** Key flags for testing without hardware:
+- `--dry-run`: skip Modal entirely, AI voices = sine tones (440/554/659 Hz)
+- `--dry-run-latency 5.7`: simulate A100 timing to test buffer headroom
+- `--list-devices`: list all audio and MIDI devices then exit
+- `--capture-device "CABLE Output"`: force VB-Cable after installation
+- `--capture-device "Stereo Mix"`: force Stereo Mix explicitly
+- `--save-loops ./debug_loops`: save each captured loop to WAV
+- `--no-click`: silent count-in
+- `--log-level debug`: full trace logging

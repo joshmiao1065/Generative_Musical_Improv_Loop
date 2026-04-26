@@ -1,0 +1,105 @@
+{
+  "port_name_substring": "Intech Grid",
+  "controls": [
+    {
+      "label": "record_toggle",
+      "channel": 0,
+      "midi_type": "note",
+      "note_number": 40,
+      "type": "button",
+      "note": "Button 1 (col 1 top) — toggles record/play. First press: 2-bar count-in then record. Press again while recording: stop + loop. Press while playing: restart."
+    },
+    {
+      "label": "voice_1_toggle",
+      "channel": 0,
+      "midi_type": "note",
+      "note_number": 41,
+      "type": "button",
+      "note": "Button 2 (col 2 top) — enable/disable AI Voice 1"
+    },
+    {
+      "label": "voice_2_toggle",
+      "channel": 0,
+      "midi_type": "note",
+      "note_number": 42,
+      "type": "button",
+      "note": "Button 3 (col 3 top) — enable/disable AI Voice 2"
+    },
+    {
+      "label": "voice_3_toggle",
+      "channel": 0,
+      "midi_type": "note",
+      "note_number": 43,
+      "type": "button",
+      "note": "Button 4 (col 4 top) — enable/disable AI Voice 3"
+    },
+    {
+      "label": "genre_0",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 36,
+      "type": "fader",
+      "note": "Fader 1 (col 1 middle) — genre blend weight 0 [0.0–1.0]"
+    },
+    {
+      "label": "genre_1",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 37,
+      "type": "fader",
+      "note": "Fader 2 (col 2 middle) — genre blend weight 1 [0.0–1.0]"
+    },
+    {
+      "label": "genre_2",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 38,
+      "type": "fader",
+      "note": "Fader 3 (col 3 middle) — genre blend weight 2 [0.0–1.0]"
+    },
+    {
+      "label": "genre_3",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 39,
+      "type": "fader",
+      "note": "Fader 4 (col 4 middle) — genre blend weight 3 [0.0–1.0]"
+    },
+    {
+      "label": "guidance_weight",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 32,
+      "type": "knob",
+      "range": [0.0, 10.0],
+      "note": "Knob 1 (col 1 bottom) — CFG guidance strength"
+    },
+    {
+      "label": "temperature",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 33,
+      "type": "knob",
+      "range": [0.0, 2.0],
+      "note": "Knob 2 (col 2 bottom) — sampling temperature"
+    },
+    {
+      "label": "topk",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 34,
+      "type": "knob",
+      "range": [0, 100],
+      "note": "Knob 3 (col 3 bottom) — top-K sampling (0 = disabled)"
+    },
+    {
+      "label": "model_feedback",
+      "channel": 0,
+      "midi_type": "cc",
+      "cc": 35,
+      "type": "knob",
+      "range": [0.0, 1.0],
+      "note": "Knob 4 (col 4 bottom) — AI output self-feedback into context"
+    }
+  ]
+}
