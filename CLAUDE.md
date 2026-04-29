@@ -3,7 +3,7 @@
 > **Project**: Cooper Union — Generative Machine Learning, Final Project
 > **Developer**: Josh Miao
 > **GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop
-> **Last Updated**: 2026-04-28 (Session 9 — monitoring passthrough fixed, Modal migrated to 3 separate classes + A100-40GB, Button 1 gated on warmup, detailed startup logging)
+> **Last Updated**: 2026-04-29 (Session 10 — soundfile fix, _generation_in_flight gate, crossfader knob, memory leak fix in AIVoice, tests 22/22)
 
 ---
 
@@ -18,6 +18,9 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 6. Voice audio is trim/pad-corrected at each loop boundary — the strict shape check was a bug (now fixed)
 7. `pbf4_cc_map.json` has empty `cc_controls` — CC numbers were manually entered, must be verified with hardware
 8. Live monitoring passthrough uses `_MonitorFIFO` in `loop_capture.py` — do NOT revert to reading the last N frames from the ring buffer. That approach plays the same frames 4× when input blocksize (2048) > output blocksize (512), distorting pitch and timbre.
+9. `embed_style()` returns a **raw numpy/JAX array**, NOT a `StyleEmbedding` object. Do NOT access `.embedding` on it. For genre blending: `blended = sum(float(w) * e for w, e in zip(ws, embeddings))` — the result is a raw array, set directly as `self.voice.style_embedding = blended`.
+10. `_generation_in_flight` flag prevents queue buildup — only one Modal generation per voice set is dispatched at a time. If generation takes longer than one loop, subsequent passes are **intentionally skipped** (logged as WARNING). Do not remove this gate.
+11. Crossfader (Knob 3 / `k/K` key): `AudioMixer._crossfade_ai` is a separate multiplier applied on top of `_voice_volume[i]`. `queue_voice()` resets `_voice_volume[i]` on each boundary but does NOT touch `_crossfade_ai`. DJ curve: center = both full, hard-left = you only, hard-right = AI only.
 
 ---
 
@@ -51,8 +54,8 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 | Column | Button | Fader | Knob |
 |--------|--------|-------|------|
 | 1 | Record start/restart | Genre 1 weight | `guidance_weight` [0–10] |
-| 2 | Stop session | Genre 2 weight | `temperature` [0–4] |
-| 3 | Enable AI Voice 3 | Genre 3 weight | `topk` [0–1024] |
+| 2 | Stop session | Genre 2 weight | `temperature` [0–2] |
+| 3 | Enable AI Voice 3 | Genre 3 weight | `crossfade` [0–1] (0=you, 0.5=both, 1=AI) |
 | 4 | Enable AI Voice 4 | Genre 4 weight | `model_feedback` [0–1] |
 
 **⚠ CC NUMBERS ENTERED MANUALLY — MUST VERIFY WITH HARDWARE:**
@@ -117,12 +120,13 @@ modal logs magenta-rt-server
 | kwarg | Type | Range | PBF4 |
 |-------|------|-------|------|
 | `guidance_weight` | float | 0–10 | Knob 1 |
-| `temperature` | float | 0–4 | Knob 2 |
-| `topk` | int | 0–1024 | Knob 3 |
+| `temperature` | float | 0–2 | Knob 2 |
+| `topk` | int | 0–1024 | (fixed at default 30 — Knob 3 replaced by crossfader) |
 | `model_feedback` | float | 0–1 | Knob 4 |
 | `model_volume` | float | 0–1 | fixed |
 | `bpm` | int | 60–200 | from CLI |
 | `beats_per_loop` | int | 1–64 | from CLI |
+| `crossfade` | float | 0–1 | Knob 3 (mixer, not Modal param) |
 
 **Lyria RealTime API: ELIMINATED.** Text-only input, no audio injection. Do not revisit.
 **Colab: ELIMINATED.** Session disconnects, no persistent URL. Modal is the sole deployment target.
@@ -289,8 +293,9 @@ Genre list and instrument list configurable at CLI: `--genres "jazz" "blues" --i
 | 3 | How many genres must be specified? | **⚠ OPEN** — 2 genres with 2 faders unused OK? |
 | 4 | Analog Lab routing confirmed? | **⚠ OPEN** — documented (standalone → CABLE Input) but not yet tested; Surge XT is confirmed working |
 | 5 | VB-Cable installed? | **✓ RESOLVED** — installed 2026-04-26, device [2], 48kHz stereo, WASAPI shared mode |
-| 6 | A100-40GB real-time benchmark? | **⚠ OPEN** — containers confirmed active; RTF not yet measured. A100-80GB was 1.431× (2.32s headroom). 40GB has same compute, less bandwidth — expect ~1.1–1.3× |
-| 7 | Modal end-to-end test with real generation? | **⚠ OPEN** — containers warm, pings pending until `@modal.enter()` completes; full generate_pass not yet tested this session |
+| 6 | A100-40GB real-time benchmark post-soundfile-fix? | **⚠ OPEN** — librosa→soundfile fix reduces server-side overhead by ~1-2s. Expected RTF now ~0.7-0.9× (well under 1.0×). Need to measure with a real session. |
+| 7 | Genre blending with raw embedding arrays? | **⚠ OPEN** — `embed_style()` returns raw numpy array. Blending via `sum(w*e)` gives a raw array. Does `style_model.tokenize(raw_array)` work inside `generate_chunk`? Only testable on Modal. |
+| 8 | Crossfader Knob 3 pickup at startup? | **⚠ OPEN** — PBF4 doesn't send CC until knob is moved; mixer defaults to `_crossfade_ai=1.0` (AI full). Fine until user moves knob, then it jumps to the physical position. First move is a jump not a sweep. |
 
 ---
 

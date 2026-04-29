@@ -248,6 +248,56 @@ class TestShapeMismatch(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Test: crossfader
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCrossfade(unittest.TestCase):
+
+    def test_center_both_full(self):
+        """Crossfade at 0.5 (center) leaves user=1.0 and AI=1.0."""
+        mixer = _make_mixer()
+        mixer.set_crossfade(0.5)
+        self.assertAlmostEqual(mixer.user_volume, 1.0)
+        self.assertAlmostEqual(mixer._crossfade_ai, 1.0)
+
+    def test_hard_left_user_only(self):
+        """Crossfade at 0.0 gives user=1.0, AI=0.0."""
+        mixer = _make_mixer()
+        mixer.set_crossfade(0.0)
+        self.assertAlmostEqual(mixer.user_volume, 1.0)
+        self.assertAlmostEqual(mixer._crossfade_ai, 0.0)
+
+    def test_hard_right_ai_only(self):
+        """Crossfade at 1.0 gives user=0.0, AI=1.0."""
+        mixer = _make_mixer()
+        mixer.set_crossfade(1.0)
+        self.assertAlmostEqual(mixer.user_volume, 0.0)
+        self.assertAlmostEqual(mixer._crossfade_ai, 1.0)
+
+    def test_clamping(self):
+        """Out-of-range values are clamped to [0, 1]."""
+        mixer = _make_mixer()
+        mixer.set_crossfade(-0.5)
+        self.assertAlmostEqual(mixer.user_volume, 1.0)
+        self.assertAlmostEqual(mixer._crossfade_ai, 0.0)
+        mixer.set_crossfade(2.0)
+        self.assertAlmostEqual(mixer.user_volume, 0.0)
+        self.assertAlmostEqual(mixer._crossfade_ai, 1.0)
+
+    def test_crossfade_does_not_affect_voice_volume(self):
+        """_crossfade_ai is separate from _voice_volume — queue_voice doesn't reset it."""
+        mixer = _make_mixer()
+        mixer.set_crossfade(0.0)   # AI silent
+        loop_len = 4800
+        mixer._loop_audio = _sine(loop_len)
+        mixer.queue_voice(0, _sine(loop_len, 660.0), volume=0.85)
+        mixer._on_boundary()
+        # _voice_volume should be 0.85 from queue_voice, but _crossfade_ai stays 0.0
+        self.assertAlmostEqual(mixer._voice_volume[0], 0.85)
+        self.assertAlmostEqual(mixer._crossfade_ai, 0.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Test: queue behaviour
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -308,7 +358,7 @@ if __name__ == "__main__":
     print("Running AudioMixer unit tests (no hardware required)...\n")
     loader = unittest.TestLoader()
     suite  = unittest.TestSuite()
-    for cls in [TestVoiceEnableDisable, TestShapeMismatch, TestQueueBehaviour]:
+    for cls in [TestVoiceEnableDisable, TestShapeMismatch, TestCrossfade, TestQueueBehaviour]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)

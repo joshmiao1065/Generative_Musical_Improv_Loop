@@ -47,7 +47,53 @@ Without `t5x_partitioning.py.patch`, the model crashes on GPU (calls TPU-only `b
 - Threading on one GPU: 0.99× speedup — JAX serializes GPU calls. Useless.
 - **Architecture locked**: 1 A100 per voice, 3 containers in parallel. Wall time ≈ 5.68s vs 8s loop. 2.32s headroom.
 
-**`modal.parameter()` + `min_containers > 0` fails at deploy.**
+---
+
+## Generation Performance & Correctness (Session 10 — 2026-04-29)
+
+**`librosa.load` was the root cause of 24–38s generation times.**
+Server was calling `librosa.load(io.BytesIO(wav_bytes), sr=48000, mono=False)` twice per voice
+per pass (user_loop + prior_mix). librosa's Python-side resampling + format-detection overhead
+takes 1–2s per call even for PCM_24 WAV files it doesn't need to resample. The same file read
+with `sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)` takes ~10ms.
+Fix: replaced librosa with soundfile in both `server/magenta_server.py` `_impl_generate_pass`
+and `src/modal_client.py` `_wav_bytes_to_np`. Client-side decode (response WAV) was also librosa.
+Expected improvement: wall time 24–38s → ~5–7s. This brings the system within the target RTF
+(8s loop / 5.7s generate = 1.4× headroom) even at 120 BPM / 16 beats.
+**Always use soundfile for WAV decode in performance-critical paths.**
+
+**Genre blending crash: `embed_style()` returns raw numpy array, not `StyleEmbedding`.**
+Server genre blending code called `e.embedding` on the return value of `model.embed_style()`.
+Runtime error: `'numpy.ndarray' object has no attribute 'embedding'`. Fix: use `e` directly.
+Weighted blend: `blended = sum(float(w) * e for w, e in zip(ws, embeddings))`.
+Do NOT wrap the result in `musiccoca.StyleEmbedding(...)` — set `self.voice.style_embedding = blended`
+directly (consistent with what `embed_style()` returns). Whether `generate_chunk`'s internal
+`style_model.tokenize(raw_array)` accepts raw arrays is still **untested on real hardware**.
+This will either work (most likely, since non-blended generation works) or require wrapping.
+
+**`_generation_in_flight` flag prevents unbounded pass queue buildup.**
+Without the flag: if Modal generation takes 24s and the loop is 3.4s, passes 1–7 all dispatch
+while pass 0's generation is still running. Each dispatched coroutine is queued in the asyncio
+loop. Eventually the queue drains but outputs arrive 7 passes late and voice audio no longer
+aligns with anything the user played. Fix: `_generation_in_flight` bool guarded by `_lock`.
+Set True at dispatch, cleared in `finally:` block of `_generate_pass`. If True at the next
+pass boundary, the dispatch is skipped (logged as WARNING). The generation count stays at 1
+in flight at all times. The `finally` block guarantees the flag is never stuck True even on
+Modal exceptions.
+
+**`AIVoice._inj.all_inputs` / `all_outputs` memory leak in `src/magenta_backend.py`.**
+Each `step()` call concatenates CHUNK_SAMPLES (96,000 frames = ~375KB) onto both arrays.
+At 120 BPM / 16 beats = 4 steps/pass × 225 passes/hour = 900 steps/hour = ~340 MB/hr per voice.
+Three voices = ~1 GB/hr. The arrays are never trimmed — only a fixed-size window is actually
+read. Fix: after each concatenation, trim to `_io_offset + _mix_samples + CHUNK_SAMPLES` for
+inputs and `_mix_samples + CHUNK_SAMPLES` for outputs. These bounds include the full access
+window with one chunk of slack. Session memory now stays constant after the first few steps.
+
+---
+
+## Modal Architecture — Separate Classes Required (Session 9 — 2026-04-28)
+
+**`modal.parameter()` + `min_containers > 0` is unsupported. Use 3 separate named classes.**
 Error: "Parameterized Functions cannot have `min_containers > 0`". Correct: omit `min_containers` entirely (defaults to 0). Use `scaledown_window=600` to keep containers alive 10 min after last call. Before a session, call `ping_all()` to warm all 3 containers (triggers model load, ~3 min first time, instant after).
 
 **`buffer_containers=3` on a parameterized class burns the 10-GPU quota.**

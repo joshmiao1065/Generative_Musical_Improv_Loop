@@ -9,8 +9,7 @@ Implements:
 Design principles:
   - No Colab UI dependencies (no ipywidgets, colab_utils, etc.)
   - No globals — all state is encapsulated in AIVoice instances
-  - Swappable: AIVoice implements the AIInstrumentBackend contract (see CLAUDE.md Section 6)
-  - The cascade logic lives in the caller (poc_cascade.py), not here
+  - The cascade/mixing logic lives in the Modal server (magenta_server.py), not here
 
 Source reference: Official Magenta RT Audio Injection notebook
   https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Audio_Injection.ipynb
@@ -292,8 +291,13 @@ class AIVoice:
         """
         chunk = self._ensure_stereo(input_chunk)
 
-        # 1. Accumulate input history
+        # 1. Accumulate input history, capped to the window actually read below.
+        # Without the cap, all_inputs grows by CHUNK_SAMPLES every step and is
+        # never freed — ~230 MB/min per voice at 120 BPM / 16 beats → OOM.
         self._inj.all_inputs = np.concatenate([self._inj.all_inputs, chunk], axis=0)
+        _in_cap = self._io_offset + self._mix_samples + CHUNK_SAMPLES
+        if self._inj.all_inputs.shape[0] > _in_cap:
+            self._inj.all_inputs = self._inj.all_inputs[-_in_cap:]
 
         # 2. Build mix: recent input + recent model output × feedback
         in_window  = self._inj.all_inputs[-(self._io_offset + self._mix_samples):-self._io_offset]
@@ -325,6 +329,9 @@ class AIVoice:
         # 6. Accumulate output history (pre-fade portion for accurate future injection)
         pre_fade = waveform.samples[self._fade.size :]
         self._inj.all_outputs = np.concatenate([self._inj.all_outputs, pre_fade], axis=0)
+        _out_cap = self._mix_samples + CHUNK_SAMPLES
+        if self._inj.all_outputs.shape[0] > _out_cap:
+            self._inj.all_outputs = self._inj.all_outputs[-_out_cap:]
 
         # 7. Crossfade + volume scale
         output = self._fade(waveform.samples) * self.params.model_volume

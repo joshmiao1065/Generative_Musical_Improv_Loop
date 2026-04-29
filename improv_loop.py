@@ -484,7 +484,7 @@ class ImprovSession:
                             self.mixer._voice_enabled[i])
 
         except Exception as e:
-            logger.error("[Session] Modal generation error (pass %d): %s", pass_num, e)
+            logger.exception("[Session] Modal generation error (pass %d): %s", pass_num, e)
         finally:
             with self._lock:
                 self._generation_in_flight = False
