@@ -240,3 +240,55 @@ starting a session. Python will try to open at 48000 and may fail or resample.
 - No MIDI devices present during this test (PBF4 / MicroLab not connected)
 - `--dry-run --capture-device "CABLE Output"` launched successfully
 - Session flow confirmed: devices detected → layout loaded → streams started → ready
+
+---
+
+## Live Monitoring Passthrough (Session 9 — 2026-04-28)
+
+**"Read last N frames" approach produces wrong pitch and timbre.**
+First monitoring implementation called `_read_last(n)` from LoopCapture's ring buffer in
+AudioMixer's output callback. This worked when input and output blocksizes matched, but
+LoopCapture defaults to blocksize=2048 and AudioMixer uses blocksize=512. With a 4:1 ratio,
+`get_monitor_frames(512)` returned the same 512 frames 4× per input block before new audio
+arrived. The output played each 512-sample chunk 4 times at normal sample rate, which is
+equivalent to slowing the audio to 1/4 speed then looping it — every keyboard note sounded
+the same pitch and had no synth timbre.
+Fix: replaced with `_MonitorFIFO` (in `src/loop_capture.py`). Input callback writes all
+captured audio into the FIFO with `write(indata)`. Output callback drains exactly `frames`
+from the FIFO with `read(frames)` every tick. Each sample is consumed exactly once, in order,
+regardless of blocksize mismatch. The FIFO's capacity is 4096 frames (~85ms) so it absorbs
+any scheduling jitter between input and output PortAudio threads.
+**Do not revert to ring-buffer reads for monitoring.** The FIFO is the correct architecture.
+Confirmed working: Surge XT timbre and pitch pass through correctly at ~10–20ms latency.
+
+---
+
+## Modal Architecture — Separate Classes Required (Session 9 — 2026-04-28)
+
+**`modal.parameter()` + `min_containers > 0` is unsupported. Use 3 separate named classes.**
+Previous sessions used `VoiceServer` with `voice_index: int = modal.parameter()` which
+requires lazy loading (min_containers=0). Containers only spun up on first call, causing
+perpetually-pending tasks if the GPU wasn't immediately available. Attempts to add
+`min_containers=1` to the parameterized class failed with Modal's own validation error.
+Fix: replaced with `Voice0Server`, `Voice1Server`, `Voice2Server` — three explicit classes,
+each with `VOICE_INDEX` as a class attribute and `min_containers=1`. The server still has
+only one copy of the logic (in `_impl_*` module-level functions). Each class is a thin
+wrapper that delegates to these. The client (`src/modal_client.py`) looks up each class by
+name: `modal.Cls.from_name(APP_NAME, "Voice0Server")()` etc.
+**Do not re-introduce `modal.parameter()`.** The three-class approach is the locked design.
+
+**A100-40GB confirmed available (Session 9).** A100-80GB was also available but burned
+6-10 GPU slots due to `buffer_containers=3` bug in an earlier session (see GPU section).
+After switching to `GPU_TYPE = "A100-40GB"`, 3 containers appeared on the Modal dashboard
+within ~1 minute of `modal deploy`. GPU type string in Modal is case-insensitive; `"A100-40GB"`
+and `"a100-40gb"` both work.
+
+**"Active" container ≠ model ready. Cold boot takes 5–8 min.**
+When Modal shows a container as "active," the GPU is allocated and Python has started, but
+`@modal.enter()` (which loads SpectroStream + MagentaRT weights + JIT-compiles XLA kernels)
+is still running. Any `.remote()` method calls during this window are queued/pending — they
+will NOT appear as "running" on the Modal dashboard until `@modal.enter()` completes.
+Observed symptom: `prime_server.py` calls `.ping.remote.aio()`, but the call doesn't appear
+on the dashboard and never returns (pending). This is NORMAL for the first 5–8 min after
+deploy. Watch the container logs for `[Voice N] *** READY ***` — only after that will pings
+return. To stream logs: `modal logs magenta-rt-server`.

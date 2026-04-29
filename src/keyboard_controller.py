@@ -14,8 +14,8 @@ Key bindings:
     -                guidance_weight  -0.5
     t                temperature      +0.1
     T                temperature      -0.1
-    k                topk             +5
-    K                topk             -5
+    k                crossfade        +0.1  (more AI)
+    K                crossfade        -0.1  (more you)
     f                model_feedback   +0.05
     F                model_feedback   -0.05
     ] / [            genre_0 weight   ±0.1
@@ -76,10 +76,14 @@ _PARAM_ADJUSTMENTS: Dict[str, tuple] = {
     "-": ("guidance_weight", -0.5),
     "t": ("temperature",     +0.1),
     "T": ("temperature",     -0.1),
-    "k": ("topk",            +5),
-    "K": ("topk",            -5),
     "f": ("model_feedback",  +0.05),
     "F": ("model_feedback",  -0.05),
+}
+
+# k/K adjust crossfade (not a GenerationParams field)
+_CROSSFADE_ADJUSTMENTS: Dict[str, float] = {
+    "k": +0.1,
+    "K": -0.1,
 }
 
 # (genre_index, delta)
@@ -97,7 +101,6 @@ _GENRE_ADJUSTMENTS: Dict[str, tuple] = {
 _PARAM_RANGES = {
     "guidance_weight": (0.0,  10.0, False),
     "temperature":     (0.0,   4.0, False),
-    "topk":            (0,    1024, True),
     "model_feedback":  (0.0,   1.0, False),
 }
 
@@ -134,6 +137,8 @@ class QwertyController:
 
         self.genre_weights: List[float] = [1.0, 0.0, 0.0, 0.0]
         self._genre_lock   = threading.Lock()
+        self._crossfade:    float = 0.5
+        self._crossfade_cb: Optional[Callable] = None
 
         self._callbacks:    Dict[str, List[Callable]] = {lbl: [] for lbl in _BUTTON_LABELS}
         self._toggle_state: Dict[str, bool]           = {lbl: False for lbl in _TOGGLE_LABELS}
@@ -156,6 +161,10 @@ class QwertyController:
                 f"Unknown event '{event}'. Valid: {sorted(self._callbacks)}"
             )
         self._callbacks[event].append(callback)
+
+    def on_crossfade(self, cb: Callable):
+        """Register callback for k/K crossfade keys. Called with pos [0.0–1.0]."""
+        self._crossfade_cb = cb
 
     # ── Thread control ─────────────────────────────────────────────────────────
 
@@ -248,6 +257,15 @@ class QwertyController:
             setattr(self.params, attr, new)
             logger.info("[QWERTY] %s = %s", attr, new)
 
+        elif ch in _CROSSFADE_ADJUSTMENTS:
+            self._crossfade = max(0.0, min(1.0, self._crossfade + _CROSSFADE_ADJUSTMENTS[ch]))
+            logger.info("[QWERTY] crossfade = %.2f", self._crossfade)
+            if self._crossfade_cb is not None:
+                try:
+                    self._crossfade_cb(self._crossfade)
+                except Exception as e:
+                    logger.error("[QWERTY] crossfade callback error: %s", e)
+
         elif ch in _GENRE_ADJUSTMENTS:
             idx, delta = _GENRE_ADJUSTMENTS[ch]
             with self._genre_lock:
@@ -291,7 +309,7 @@ class QwertyController:
         print("\n[QWERTY Status]")
         print(f"  guidance_weight = {p.guidance_weight:.2f}   (+ / -)")
         print(f"  temperature     = {p.temperature:.2f}   (t=up  T=down)")
-        print(f"  topk            = {p.topk}   (k=up  K=down)")
+        print(f"  crossfade       = {self._crossfade:.2f}   (k=AI up  K=AI down)")
         print(f"  model_feedback  = {p.model_feedback:.3f}   (f=up  F=down)")
         print(f"  genre_weights   = {[f'{w:.2f}' for w in gw]}")
         print(f"                    genre0=]/[  genre1=';/;  genre2=./,  genre3=M/m")
@@ -311,7 +329,7 @@ class QwertyController:
         print("    q                quit session")
         print("    + / -            guidance_weight  ±0.5")
         print("    t / T            temperature      ±0.1")
-        print("    k / K            topk             ±5")
+        print("    k / K            crossfade        ±0.1  (0=you, 0.5=both, 1=AI)")
         print("    f / F            model_feedback   ±0.05")
         print("    ] / [            genre 0 weight   ±0.1")
         print("    ' / ;            genre 1 weight   ±0.1")

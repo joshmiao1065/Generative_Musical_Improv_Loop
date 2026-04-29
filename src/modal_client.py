@@ -56,10 +56,12 @@ except ImportError:
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-APP_NAME    = "magenta-rt-server"
-CLASS_NAME  = "VoiceServer"
-SAMPLE_RATE = 48000
-N_VOICES    = 3
+APP_NAME         = "magenta-rt-server"
+# One class per voice — required because modal.parameter() is incompatible with
+# min_containers > 0. Three explicit classes allow min_containers=1 on each.
+VOICE_CLASS_NAMES = ["Voice0Server", "Voice1Server", "Voice2Server"]
+SAMPLE_RATE       = 48000
+N_VOICES          = 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,11 +77,10 @@ def _np_to_wav_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> bytes
 
 def _wav_bytes_to_np(wav_bytes: bytes, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
     """Decode WAV bytes to (N, 2) float32 numpy array at SAMPLE_RATE."""
-    import librosa
-    audio, sr = librosa.load(io.BytesIO(wav_bytes), sr=sample_rate, mono=False)
-    if audio.ndim == 1:
-        audio = np.stack([audio, audio], axis=0)
-    return audio.T.astype(np.float32)
+    audio, sr = sf.read(io.BytesIO(wav_bytes), dtype="float32", always_2d=True)
+    if audio.shape[1] == 1:
+        audio = np.concatenate([audio, audio], axis=1)
+    return audio
 
 
 def _silence_like(reference: np.ndarray) -> np.ndarray:
@@ -136,13 +137,12 @@ class MagentaRTClient:
         self.topk = topk
         self.model_feedback = model_feedback
 
-        # Look up the deployed VoiceServer class
-        # This does NOT start containers — it just creates callable handles
-        self._VoiceServer = modal.Cls.from_name(APP_NAME, CLASS_NAME)
-
-        # One handle per voice. Voice containers are identified by voice_index.
+        # Look up one handle per voice — each is a separate named class so that
+        # min_containers=1 can be set on each (modal.parameter + min_containers
+        # is not supported by Modal).
         self._voices = [
-            self._VoiceServer(voice_index=i) for i in range(n_voices)
+            modal.Cls.from_name(APP_NAME, VOICE_CLASS_NAMES[i])()
+            for i in range(n_voices)
         ]
 
         # Previous pass outputs, indexed by voice. None = first pass (use silence).

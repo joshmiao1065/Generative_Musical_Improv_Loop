@@ -1,6 +1,84 @@
 {
+  "MicroLab mk3 1": {
+    "cc_controls": {
+      "ch0_cc1": {
+        "channel": 0,
+        "cc": 1,
+        "min_val": 22,
+        "max_val": 69,
+        "samples": 6,
+        "label": "UNKNOWN"
+      }
+    },
+    "note_buttons": {}
+  },
   "Intech Grid MIDI device 0": {
-    "cc_controls": {},
+    "cc_controls": {
+      "ch0_cc32": {
+        "channel": 0,
+        "cc": 32,
+        "min_val": 0,
+        "max_val": 73,
+        "samples": 63,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc33": {
+        "channel": 0,
+        "cc": 33,
+        "min_val": 0,
+        "max_val": 54,
+        "samples": 38,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc34": {
+        "channel": 0,
+        "cc": 34,
+        "min_val": 0,
+        "max_val": 74,
+        "samples": 57,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc35": {
+        "channel": 0,
+        "cc": 35,
+        "min_val": 2,
+        "max_val": 32,
+        "samples": 20,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc36": {
+        "channel": 0,
+        "cc": 36,
+        "min_val": 0,
+        "max_val": 127,
+        "samples": 27,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc37": {
+        "channel": 0,
+        "cc": 37,
+        "min_val": 0,
+        "max_val": 127,
+        "samples": 22,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc38": {
+        "channel": 0,
+        "cc": 38,
+        "min_val": 0,
+        "max_val": 127,
+        "samples": 15,
+        "label": "UNKNOWN"
+      },
+      "ch0_cc39": {
+        "channel": 0,
+        "cc": 39,
+        "min_val": 0,
+        "max_val": 127,
+        "samples": 22,
+        "label": "UNKNOWN"
+      }
+    },
     "note_buttons": {
       "ch0_note40": {
         "channel": 0,
@@ -9,7 +87,7 @@
           0,
           127
         ],
-        "label": "record_toggle"
+        "label": "UNKNOWN"
       },
       "ch0_note41": {
         "channel": 0,
@@ -18,7 +96,7 @@
           0,
           127
         ],
-        "label": "voice_1_toggle"
+        "label": "UNKNOWN"
       },
       "ch0_note42": {
         "channel": 0,
@@ -27,7 +105,7 @@
           0,
           127
         ],
-        "label": "voice_2_toggle"
+        "label": "UNKNOWN"
       },
       "ch0_note43": {
         "channel": 0,
@@ -36,7 +114,7 @@
           0,
           127
         ],
-        "label": "voice_3_toggle"
+        "label": "UNKNOWN"
       }
     }
   }

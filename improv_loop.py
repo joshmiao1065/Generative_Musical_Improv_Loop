@@ -46,7 +46,7 @@ Controls (PBF4):
     Faders    — genre blend weights (passed to Modal as style context)
     Knob 1    — guidance_weight  [0–10]
     Knob 2    — temperature      [0–2]
-    Knob 3    — topk             [0–100]
+    Knob 3    — crossfade        [0–1] (0=you only, 0.5=both full, 1=AI only)
     Knob 4    — model_feedback   [0–1]
 
 Controls (--qwerty fallback, when PBF4 not connected):
@@ -54,7 +54,7 @@ Controls (--qwerty fallback, when PBF4 not connected):
     1 / 2 / 3   — toggle AI Voice 1 / 2 / 3
     q           — quit
     + / -       — guidance_weight ±0.5
-    t / T       — temperature ±0.1   k / K — topk ±5   f / F — model_feedback ±0.05
+    t / T       — temperature ±0.1   k / K — crossfade ±0.1   f / F — model_feedback ±0.05
     ] / [       — genre 0 weight ±0.1   ' / ; — genre 1   . / , — genre 2   M/m — genre 3
     ?           — print current params
 
@@ -165,8 +165,17 @@ class ImprovSession:
         # Pass tracking for cascade voice entry schedule
         self._pass_number = 0
 
+        # True while a Modal generation coroutine is running. Prevents a
+        # second dispatch from queuing behind a slow one — each pass either
+        # generates or skips, so lag never accumulates unboundedly.
+        self._generation_in_flight = False
+
         # Signal main thread to exit
         self._stop_event = threading.Event()
+
+        # Set once all Modal containers have confirmed warm via ping.
+        # Record button is blocked until this is set (skipped in dry-run).
+        self._containers_ready = threading.Event()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -209,10 +218,14 @@ class ImprovSession:
         self.ctrl.on("voice_1_toggle", lambda: self._handle_voice_toggle(0))
         self.ctrl.on("voice_2_toggle", lambda: self._handle_voice_toggle(1))
         self.ctrl.on("voice_3_toggle", lambda: self._handle_voice_toggle(2))
+        self.ctrl.on_crossfade(self.mixer.set_crossfade)
 
         # QwertyController fires "quit"; PBF4Controller does not have this event
         if hasattr(self.ctrl, "_callbacks") and "quit" in self.ctrl._callbacks:
             self.ctrl.on("quit", self._handle_quit)
+
+        if not getattr(self.args, 'no_monitor', False):
+            self.mixer.set_monitor(self.capture)
 
         if not self.args.dry_run:
             self.client = MagentaRTClient(
@@ -238,9 +251,10 @@ class ImprovSession:
                     self.args.bpm, self.args.beats, self.args.voices, self.args.dry_run)
 
         if not self.args.dry_run:
-            # Ping containers in background — logs status as each responds
+            # Ping containers in background — Button 1 is blocked until all respond
             asyncio.run_coroutine_threadsafe(self._warm_containers(), self._aio_loop)
         else:
+            self._containers_ready.set()   # no warmup needed in dry-run
             logger.info("[Session] Skipping Modal warmup (dry-run).")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
@@ -281,6 +295,12 @@ class ImprovSession:
         with self._lock:
             s = self.state
         if s == State.IDLE:
+            if not self._containers_ready.is_set():
+                logger.warning(
+                    "[Session] Containers not yet warm — wait for "
+                    "'All containers warm. Press Button 1 to begin.' before recording."
+                )
+                return
             self._transition(State.COUNTDOWN)
             self.engine.start_countdown()
         elif s == State.COUNTDOWN:
@@ -302,6 +322,8 @@ class ImprovSession:
         self.mixer.clear_voices()
         self._user_loop = None
         self._pass_number = 0
+        with self._lock:
+            self._generation_in_flight = False
         if self.client is not None:
             asyncio.run_coroutine_threadsafe(self.client.reset(), self._aio_loop)
         hint = "Press Space to record a new loop." if self.args.qwerty else "Press Button 1 to record a new loop."
@@ -339,6 +361,8 @@ class ImprovSession:
         self._user_loop = loop
         self.mixer.set_loop(loop)
         self._pass_number = 0
+        with self._lock:
+            self._generation_in_flight = False
 
         rms = float(np.sqrt(np.mean(loop ** 2)))
         logger.info("[Session] Loop captured: %.2fs  %d samples  RMS=%.4f",
@@ -363,8 +387,16 @@ class ImprovSession:
             if self.state != State.PLAYING:
                 return
             loop = self._user_loop
+            if self._generation_in_flight:
+                logger.warning(
+                    "[Session] Pass %d skipped — previous generation still in flight", pass_num
+                )
+                return
+            self._generation_in_flight = True
 
         if loop is None:
+            with self._lock:
+                self._generation_in_flight = False
             return
 
         self._pass_number = pass_num
@@ -383,42 +415,46 @@ class ImprovSession:
                     self.args.voices)
 
         async def _ping_one(i: int):
-            logger.info("[Modal] Waiting for Voice %d container...", i + 1)
+            print(f"[Modal] Voice {i+1}: waiting for container (XLA compile ~5-8 min first boot)...")
             try:
                 result = await asyncio.wait_for(
                     self.client._voices[i].ping.remote.aio(),
                     timeout=600,   # 10 min: covers cold start + XLA compile
                 )
-                logger.info("[Modal] Voice %d ready: %s", i + 1, result)
+                print(f"[Modal] Voice {i+1}: ready — {result}")
             except asyncio.TimeoutError:
-                logger.error("[Modal] Voice %d timed out (>10 min). "
-                             "Check modal.com/apps for errors.", i + 1)
+                print(f"[Modal] Voice {i+1}: TIMED OUT (>10 min). Check modal.com/apps for errors.")
             except Exception as e:
-                logger.error("[Modal] Voice %d error: %s", i + 1, e)
+                print(f"[Modal] Voice {i+1}: ERROR — {e}")
 
         try:
             # All voices pinged simultaneously — warm-up time = max(V0,V1,V2), not sum
             await asyncio.gather(*[_ping_one(i) for i in range(self.args.voices)])
-            logger.info("[Modal] All containers checked. Press Button 1 to begin.")
+            self._containers_ready.set()
+            print("\n" + "═" * 54)
+            print("  ALL VOICES READY — Press Button 1 to record")
+            print("═" * 54 + "\n")
         except Exception as e:
             logger.error("[Modal] Warm-up error: %s", e)
+            self._containers_ready.set()
+            print("\n[Modal] Warm-up had errors — check logs. Button 1 unblocked.\n")
 
     async def _generate_pass(self, user_loop: np.ndarray, pass_num: int):
         """Dispatch one generation pass (Modal or dry-run) and queue results into mixer."""
-        p = self.params
+        try:
+            p = self.params
 
-        genre_weights = self.ctrl.get_genre_weights()
-        logger.debug("[Session] Pass %d genre weights: %s", pass_num,
-                     [f"{w:.2f}" for w in genre_weights])
+            genre_weights = self.ctrl.get_genre_weights()
+            logger.debug("[Session] Pass %d genre weights: %s", pass_num,
+                         [f"{w:.2f}" for w in genre_weights])
 
-        if self.args.dry_run:
-            voice_outputs = self._dry_run_voices(user_loop)
-            if self.args.dry_run_latency > 0:
-                logger.debug("[DryRun] Simulating %.1fs Modal latency...",
-                             self.args.dry_run_latency)
-                await asyncio.sleep(self.args.dry_run_latency)
-        else:
-            try:
+            if self.args.dry_run:
+                voice_outputs = self._dry_run_voices(user_loop)
+                if self.args.dry_run_latency > 0:
+                    logger.debug("[DryRun] Simulating %.1fs Modal latency...",
+                                 self.args.dry_run_latency)
+                    await asyncio.sleep(self.args.dry_run_latency)
+            else:
                 voice_outputs = await self.client.generate_pass(
                     user_loop,
                     guidance_weight=p.guidance_weight,
@@ -431,24 +467,27 @@ class ImprovSession:
                     instrument=self.instrument,
                     genre_weights=genre_weights,
                 )
-            except Exception as e:
-                logger.error("[Session] Modal generation error (pass %d): %s", pass_num, e)
-                return
 
-        for i, audio in enumerate(voice_outputs):
-            # Voice entry schedule: V0 joins pass 2, V1 pass 3, V2 pass 4.
-            # Audio is always queued here — the mixer's _voice_enabled flag
-            # determines whether it's mixed into output at the next boundary.
-            # This means toggling a voice ON is instant at the next loop wrap,
-            # without waiting for another full generation round-trip.
-            if pass_num < i + 2:
-                logger.debug("[Session] Pass %d: Voice %d not yet scheduled (need pass %d)",
-                             pass_num, i + 1, i + 2)
-                continue
-            self.mixer.queue_voice(i, audio, volume=p.model_volume)
-            logger.info("[Session] Pass %d: Voice %d queued (%.2fs, enabled=%s)",
-                        pass_num, i + 1, audio.shape[0] / 48000,
-                        self.mixer._voice_enabled[i])
+            for i, audio in enumerate(voice_outputs):
+                # Voice entry schedule: V0 joins pass 2, V1 pass 3, V2 pass 4.
+                # Audio is always queued here — the mixer's _voice_enabled flag
+                # determines whether it's mixed into output at the next boundary.
+                # This means toggling a voice ON is instant at the next loop wrap,
+                # without waiting for another full generation round-trip.
+                if pass_num < i + 2:
+                    logger.debug("[Session] Pass %d: Voice %d not yet scheduled (need pass %d)",
+                                 pass_num, i + 1, i + 2)
+                    continue
+                self.mixer.queue_voice(i, audio, volume=p.model_volume)
+                logger.info("[Session] Pass %d: Voice %d queued (%.2fs, enabled=%s)",
+                            pass_num, i + 1, audio.shape[0] / 48000,
+                            self.mixer._voice_enabled[i])
+
+        except Exception as e:
+            logger.error("[Session] Modal generation error (pass %d): %s", pass_num, e)
+        finally:
+            with self._lock:
+                self._generation_in_flight = False
 
     # ── Dry-run + debug helpers ────────────────────────────────────────────────
 
@@ -567,7 +606,7 @@ Examples:
     p.add_argument("--qwerty", action="store_true",
                    help="Use QWERTY keyboard instead of PBF4. "
                         "Space=record, 1/2/3=voices, q=quit, +/-=guidance, t/T=temp, "
-                        "k/K=topk, f/F=feedback, ]/[=genre0 ±0.1, etc. "
+                        "k/K=crossfade, f/F=feedback, ]/[=genre0 ±0.1, etc. "
                         "Named 'qwerty' to avoid confusion with the MIDI keyboard.")
 
     # ── Style / genre blending ─────────────────────────────────────────────
@@ -607,6 +646,8 @@ Examples:
     dbg.add_argument("--save-loops", metavar="DIR",
                      help="Directory to save each captured loop as a timestamped WAV file. "
                           "Useful for diagnosing capture or routing issues.")
+    dbg.add_argument("--no-monitor", action="store_true",
+                     help="Disable live input monitoring passthrough (default: enabled).")
     dbg.add_argument("--no-click", action="store_true",
                      help="Disable metronome click during count-in (silent count-in).")
     dbg.add_argument("--log-level", default="info",

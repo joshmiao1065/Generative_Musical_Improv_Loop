@@ -84,13 +84,12 @@
       "note": "Knob 2 (col 2 bottom) — sampling temperature"
     },
     {
-      "label": "topk",
+      "label": "crossfade",
       "channel": 0,
       "midi_type": "cc",
       "cc": 34,
       "type": "knob",
-      "range": [0, 100],
-      "note": "Knob 3 (col 3 bottom) — top-K sampling (0 = disabled)"
+      "note": "Knob 3 (col 3 bottom) — user/AI crossfader: 0=you only, center=both full, 1=AI only"
     },
     {
       "label": "model_feedback",

@@ -3,7 +3,7 @@
 > **Project**: Cooper Union — Generative Machine Learning, Final Project
 > **Developer**: Josh Miao
 > **GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop
-> **Last Updated**: 2026-04-26 (Session 8 — voice enable/disable inversion fixed, shape mismatch fixed, debug flags added, Analog Lab routing documented)
+> **Last Updated**: 2026-04-28 (Session 9 — monitoring passthrough fixed, Modal migrated to 3 separate classes + A100-40GB, Button 1 gated on warmup, detailed startup logging)
 
 ---
 
@@ -11,12 +11,13 @@
 
 Read this file AND `LESSONS.md` before writing any code. After every session, update both files. Common mistakes:
 1. Assuming Magenta RT is a REST API — it is a Python library deployed on Modal (Section 3)
-2. Using `min_containers` on parameterized Modal classes — use `scaledown_window` instead (LESSONS.md)
+2. Using `modal.parameter()` with `min_containers` — they are incompatible. Use 3 separate named classes: `Voice0Server`, `Voice1Server`, `Voice2Server` (see Section 3)
 3. Writing MIDI CC numbers before testing physical PBF4 hardware (Section 2)
-4. Not calling `ping_all()` before a session — containers need ~3 min to warm on first use
+4. Starting a session before containers are fully warm — cold boot takes **5–8 min** (model load + XLA compile). Wait for `*** READY ***` in Modal dashboard logs AND `ALL VOICES READY` printed by improv_loop.py. Button 1 is gated until all pings return.
 5. `AudioMixer._voice_enabled` starts `[False, False, False]` — voices must be explicitly enabled via Button 2/3/4
 6. Voice audio is trim/pad-corrected at each loop boundary — the strict shape check was a bug (now fixed)
 7. `pbf4_cc_map.json` has empty `cc_controls` — CC numbers were manually entered, must be verified with hardware
+8. Live monitoring passthrough uses `_MonitorFIFO` in `loop_capture.py` — do NOT revert to reading the last N frames from the ring buffer. That approach plays the same frames 4× when input blocksize (2048) > output blocksize (512), distorting pitch and timbre.
 
 ---
 
@@ -26,13 +27,15 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 [MicroLab mk3]  ──USB-C MIDI──▶ [ThinkPad]  (musical input only — 25 keys, no knobs)
 [intech PBF4]   ──USB MIDI───▶ [ThinkPad]  (ALL parameter control)
 [Surge XT]      ──audio──▶ VB-Cable "CABLE Input" ──▶ Python captures "CABLE Output"
-[ThinkPad]      ──asyncio HTTP──▶ Modal.com (3× A100-80GB, one per AI voice)
-[ThinkPad]      ──audio──▶ speakers (Python output callback mixes user+AI)
+[ThinkPad]      ──asyncio HTTP──▶ Modal.com (3× A100-40GB, one per AI voice)
+[ThinkPad]      ──audio──▶ speakers (Python mixes live monitoring + user loop + AI voices)
 ```
 
 **Session flow:**
-1. `python improv_loop.py --bpm 120 --beats 16` — starts script, warms containers
-2. PBF4 Button 1 → 2-bar countdown → record user loop
+1. `modal deploy server/magenta_server.py` — deploy (containers begin warming immediately, ~5–8 min first boot)
+2. Watch improv_loop terminal for `ALL VOICES READY` (printed when all ping calls return)
+3. `python improv_loop.py --bpm 120 --beats 16` — starts script, Button 1 locked until containers confirm warm
+4. PBF4 Button 1 → 2-bar countdown → record user loop
 3. Loop plays; AI voices generate in parallel (buffer pass architecture)
 4. AI voices join one by one (Voice 1 at pass 3, Voice 2 at pass 5, Voice 3 at pass 7)
 5. PBF4 knobs/faders adjust live generation params
@@ -89,9 +92,25 @@ App URL: https://modal.com/apps/joshuamiao03/main/deployed/magenta-rt-server
 **Confirmed benchmark (A100-80GB):**
 - Warm chunk: 1.40s per 2.0s audio = **RTF 1.431×** ✓
 - 16-beat pass @ 120 BPM: 5.68s gen / 8.0s loop = **0.71×** ✓ (2.32s headroom)
-- Cost: ~$7.50/hr for 3 voices active. Free tier = ~4 hrs/month.
+- Cost: ~$7.50/hr for 3 voices active.
 
-**Architecture (locked):** One A100-80GB container per voice. All 3 called in parallel via `asyncio.gather`. One-pass lag between voices is intentional — each voice hears previous pass's outputs. See `src/modal_client.py`.
+**Current GPU: A100-40GB** (switched from 80GB in Session 9 — better availability on account tier; same Ampere compute, slightly less bandwidth. Benchmark not yet re-run on 40GB. A10G is NOT viable — RTF 0.873× means it always takes longer to generate than the loop duration regardless of settings.)
+
+**Architecture (locked):** Three separate named Modal classes — `Voice0Server`, `Voice1Server`, `Voice2Server` — each with `min_containers=1`. Containers warm on `modal deploy`, no prime step required. One A100-40GB container per voice. All 3 called in parallel via `asyncio.gather`. One-pass lag between voices is intentional. See `src/modal_client.py` and `server/magenta_server.py`.
+
+**Cold boot sequence per container (~5–8 min total on first deploy):**
+1. GPU allocated, Python process starts → container shows "active" on dashboard
+2. SpectroStream model loads (~10–20s)
+3. MagentaRT large model weights load (~30–60s, or instant if HF cache volume is warm)
+4. XLA JIT compile on dummy input (~2–4 min first time per container)
+5. Container logs `*** READY ***` → ping returns → `improv_loop.py` unblocks Button 1
+
+**"Active" container ≠ ready.** A container showing as "active" on the dashboard means the GPU is allocated and Python has started. The `@modal.enter()` method (model load + JIT compile) may still be running. Ping calls will be pending/queued until `@modal.enter()` completes. Watch container logs for `*** READY ***`.
+
+To stream container logs:
+```
+modal logs magenta-rt-server
+```
 
 **CONFIRMED Parameters** (all map to PBF4 knobs):
 
@@ -115,16 +134,19 @@ App URL: https://modal.com/apps/joshuamiao03/main/deployed/magenta-rt-server
 ```
 Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream (48kHz stereo float32)
                                                               ↓
-                                                    loop capture buffer
-                                                              ↓
-                                               WAV bytes → Modal VoiceServer × 3
-                                                              ↓
-                                               WAV bytes → numpy decode
-                                                              ↓
-                                          Python OutputStream: user_loop + AI mix → speakers
+                                              ┌──────────────┴──────────────┐
+                                              │                             │
+                                        loop capture buffer         _MonitorFIFO (streaming)
+                                              │                             │
+                                    WAV bytes → Modal                       │
+                                     VoiceServer × 3                        │
+                                              │                             │
+                                     numpy decode ◀──────────────────────┐  │
+                                              │                           │  │
+                                   Python OutputStream: live monitoring + user_loop + AI mix → speakers
 ```
 
-**VB-Cable setup** (Windows, one-time):
+**VB-Cable setup** (Windows, one-time, CONFIRMED WORKING 2026-04-26):
 1. Install: https://shop.vb-audio.com/en/win-apps/11-vb-cable.html
 2. Sound Settings → CABLE Input + CABLE Output → both set to 48kHz, 24-bit
 3. Surge XT → Preferences → Audio → Output: "CABLE Input"
@@ -139,7 +161,18 @@ Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream 
 - **Any DAW**: Master output → "CABLE Input" in DAW audio settings
 - Python always captures from "CABLE Output" (auto-detected) or specify: `--capture-device "CABLE Output"`
 
-**Monitoring**: Python output callback mixes VB-Cable capture + AI outputs → speakers. ~20–40ms passthrough latency. No Voicemeeter needed.
+**Live monitoring (CONFIRMED WORKING 2026-04-28):** The `_MonitorFIFO` in `loop_capture.py`
+streams captured audio directly to `AudioMixer`'s output callback. Player hears themselves
+through speakers with ~10–20ms latency at all times (idle, recording, and playback). Disable
+with `--no-monitor` if needed. Implementation note: a simple "read last N frames" approach does
+NOT work when input blocksize (2048) ≠ output blocksize (512) — it plays the same 512 frames
+4× per input block, distorting pitch and timbre. The FIFO drains correctly regardless of block sizes.
+
+**Audio format**: All internal audio is `(N, 2) float32 @ 48000 Hz`. WAV bytes over Modal are 24-bit PCM.
+
+**Without VB-Cable (Stereo Mix fallback)**: Works for initial testing, but captures ALL speaker
+audio. AI voice output bleeds back into the capture stream → fed to Modal → model responds to
+its own output. Quality degrades over time. For testing only — do not use in production sessions.
 
 **Audio format**: All internal audio is `(N, 2) float32 @ 48000 Hz`. WAV bytes over Modal are 24-bit PCM.
 
@@ -255,7 +288,9 @@ Genre list and instrument list configurable at CLI: `--genres "jazz" "blues" --i
 | 2 | Beat-alignment preference? | **⚠ OPEN** — free improv (accept drift) vs beat-locked (trim to boundary)? |
 | 3 | How many genres must be specified? | **⚠ OPEN** — 2 genres with 2 faders unused OK? |
 | 4 | Analog Lab routing confirmed? | **⚠ OPEN** — documented (standalone → CABLE Input) but not yet tested; Surge XT is confirmed working |
-| 5 | VB-Cable installed? | **⚠ OPEN** — user purchasing; code is ready (`--capture-device "CABLE Output"`) |
+| 5 | VB-Cable installed? | **✓ RESOLVED** — installed 2026-04-26, device [2], 48kHz stereo, WASAPI shared mode |
+| 6 | A100-40GB real-time benchmark? | **⚠ OPEN** — containers confirmed active; RTF not yet measured. A100-80GB was 1.431× (2.32s headroom). 40GB has same compute, less bandwidth — expect ~1.1–1.3× |
+| 7 | Modal end-to-end test with real generation? | **⚠ OPEN** — containers warm, pings pending until `@modal.enter()` completes; full generate_pass not yet tested this session |
 
 ---
 

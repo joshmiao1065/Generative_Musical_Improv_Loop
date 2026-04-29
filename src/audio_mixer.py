@@ -85,8 +85,18 @@ class AudioMixer:
         # Buttons 2/3/4 on the PBF4 toggle each voice on/off.
         self._voice_enabled: List[bool] = [False, False, False]
 
+        # Crossfader — scales all AI voices together without overwriting per-voice
+        # model_volume. Applied multiplicatively in the callback.
+        # 0.0 = AI silent, 1.0 = AI at full model_volume. Default center (0.5→1.0).
+        self._crossfade_ai: float = 1.0
+
         self._stream: Optional[sd.OutputStream] = None
         self._boundary_lock = threading.Lock()  # guards on_loop_boundary swap
+
+        # Live input monitoring: when set, the capture stream is mixed directly
+        # into the output so the user hears themselves while playing and recording.
+        self._monitor_source = None   # LoopCapture instance, or None
+        self._monitor_gain: float = 1.0
 
         # Oneshot queue for metronome clicks (played once, not looped)
         self._oneshot_queue: queue.Queue = queue.Queue(maxsize=32)
@@ -169,6 +179,35 @@ class AudioMixer:
         """Set per-voice output gain [0.0–1.0]. Thread-safe (float write is atomic)."""
         self._voice_volume[voice_idx] = max(0.0, min(1.0, volume))
 
+    def set_crossfade(self, pos: float):
+        """DJ-style crossfader [0–1]. 0=user only, 0.5=both full, 1=AI only.
+
+        user_volume and _crossfade_ai each stay at 1.0 until the fader leaves
+        center, so the default knob position (center) is transparent.
+        """
+        pos = max(0.0, min(1.0, pos))
+        self.user_volume  = min(1.0, 2.0 * (1.0 - pos))
+        self._crossfade_ai = min(1.0, 2.0 * pos)
+        logger.debug("[AudioMixer] crossfade=%.2f  user=%.2f  ai=%.2f",
+                     pos, self.user_volume, self._crossfade_ai)
+
+    def set_monitor(self, capture, gain: float = 1.0):
+        """
+        Route live input audio (from capture) directly to the output mix.
+        Enables hearing yourself while playing — the captured audio is read
+        from the LoopCapture ring buffer every output callback (~10ms lag).
+
+        Args:
+            capture: LoopCapture instance to read from, or None to disable.
+            gain:    Monitor volume multiplier [0.0–1.0]. Default 1.0.
+        """
+        self._monitor_source = capture
+        self._monitor_gain   = gain
+        if capture is not None:
+            logger.info("[AudioMixer] Live monitoring enabled (gain=%.2f)", gain)
+        else:
+            logger.info("[AudioMixer] Live monitoring disabled.")
+
     def play_oneshot(self, audio: np.ndarray):
         """
         Queue a short audio clip to be played once (not looped).
@@ -218,6 +257,14 @@ class AudioMixer:
             if self._oneshot_pos >= clip.shape[0]:
                 self._oneshot_cur = None
 
+        # Live monitoring passthrough — mix in whatever the capture device is
+        # currently receiving so the user hears themselves while playing.
+        if self._monitor_source is not None:
+            try:
+                out += self._monitor_source.read_monitor_frames(frames) * self._monitor_gain
+            except Exception:
+                pass  # never let monitoring errors kill the audio callback
+
         if loop is None:
             outdata[:] = out
             return
@@ -249,7 +296,8 @@ class AudioMixer:
                                    "skipping until next boundary", i, va.shape[0], loop_len)
                     continue
                 out[written:written + n] += (
-                    va[self._loop_pos:self._loop_pos + n] * self._voice_volume[i]
+                    va[self._loop_pos:self._loop_pos + n]
+                    * (self._voice_volume[i] * self._crossfade_ai)
                 )
 
             self._loop_pos += n

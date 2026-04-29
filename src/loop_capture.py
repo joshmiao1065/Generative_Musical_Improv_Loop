@@ -40,6 +40,63 @@ SAMPLE_RATE = 48000
 CHANNELS    = 2
 
 
+class _MonitorFIFO:
+    """
+    Streaming FIFO for monitoring passthrough between input and output callbacks.
+
+    The input callback (e.g. LoopCapture at blocksize=2048) writes large chunks;
+    the output callback (AudioMixer at blocksize=512) reads small chunks.
+    Without a FIFO, the output would read the same frames repeatedly, causing
+    pitch and timbre distortion.  This FIFO properly serialises the stream.
+
+    Capacity: 4096 frames (~85ms at 48kHz).  If the FIFO fills, the oldest
+    frames are discarded to prevent unbounded latency build-up.
+    """
+
+    _SIZE = 4096
+
+    def __init__(self):
+        self._buf  = np.zeros((self._SIZE, CHANNELS), dtype=np.float32)
+        self._wp   = 0   # write position
+        self._rp   = 0   # read position
+        self._n    = 0   # frames currently available
+        self._lock = threading.Lock()
+
+    def write(self, frames: np.ndarray) -> None:
+        n = frames.shape[0]
+        with self._lock:
+            overflow = self._n + n - self._SIZE
+            if overflow > 0:
+                self._rp = (self._rp + overflow) % self._SIZE
+                self._n -= overflow
+            end = self._wp + n
+            if end <= self._SIZE:
+                self._buf[self._wp:end] = frames
+            else:
+                f = self._SIZE - self._wp
+                self._buf[self._wp:] = frames[:f]
+                self._buf[:end - self._SIZE] = frames[f:]
+            self._wp = end % self._SIZE
+            self._n += n
+
+    def read(self, n: int) -> np.ndarray:
+        out = np.zeros((n, CHANNELS), dtype=np.float32)
+        with self._lock:
+            n_read = min(n, self._n)
+            if n_read == 0:
+                return out
+            end = self._rp + n_read
+            if end <= self._SIZE:
+                out[:n_read] = self._buf[self._rp:end]
+            else:
+                f = self._SIZE - self._rp
+                out[:f] = self._buf[self._rp:]
+                out[f:n_read] = self._buf[:end - self._SIZE]
+            self._rp = end % self._SIZE
+            self._n -= n_read
+        return out
+
+
 class LoopCapture:
     """
     Continuous ring-buffer audio capture with on-demand snapshot.
@@ -77,6 +134,9 @@ class LoopCapture:
 
         self._stream: Optional[sd.InputStream] = None
         self._capture_start_time: Optional[float] = None
+
+        # Streaming FIFO for live monitoring passthrough to AudioMixer output callback
+        self._monitor_fifo = _MonitorFIFO()
 
     # ── Stream control ────────────────────────────────────────────────────────
 
@@ -125,6 +185,10 @@ class LoopCapture:
                 self._buf[:end - self._max_samples] = indata[first:]
             self._write_pos    = end % self._max_samples
             self._frames_captured += frames
+
+        # Write to monitoring FIFO outside the ring buffer lock so the two
+        # locks are never nested (prevents potential deadlock with AudioMixer).
+        self._monitor_fifo.write(indata)
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
@@ -205,6 +269,14 @@ class LoopCapture:
         tail = self._buf[start:]   # start is negative, so this is buf[max+start:]
         head = self._buf[:end]
         return np.concatenate([tail, head], axis=0)
+
+    def read_monitor_frames(self, n: int) -> np.ndarray:
+        """
+        Drain n frames from the monitor FIFO for real-time output passthrough.
+        Called from AudioMixer's output callback thread.  Returns silence if
+        the FIFO hasn't filled yet (e.g. on first callback after start).
+        """
+        return self._monitor_fifo.read(n)
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
 

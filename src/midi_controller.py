@@ -56,13 +56,14 @@ logger = logging.getLogger(__name__)
 _PARAM_RANGES: Dict[str, tuple] = {
     "guidance_weight": (0.0,  10.0, False),
     "temperature":     (0.0,   2.0, False),
-    "topk":            (0,     100, True),
     "model_feedback":  (0.0,   1.0, False),
     "genre_0":         (0.0,   1.0, False),
     "genre_1":         (0.0,   1.0, False),
     "genre_2":         (0.0,   1.0, False),
     "genre_3":         (0.0,   1.0, False),
 }
+
+_CROSSFADE_LABEL = "crossfade"
 
 _BUTTON_LABELS  = {"record_toggle", "voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
 _TOGGLE_LABELS  = {"voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
@@ -100,6 +101,7 @@ class PBF4Controller:
 
         self.genre_weights: List[float] = [1.0, 0.0, 0.0, 0.0]
         self._genre_lock = threading.Lock()
+        self._crossfade_cb: Optional[Callable] = None
 
         self._callbacks: Dict[str, List[Callable]] = {lbl: [] for lbl in _BUTTON_LABELS}
         self._toggle_state: Dict[str, bool] = {lbl: False for lbl in _TOGGLE_LABELS}
@@ -185,6 +187,10 @@ class PBF4Controller:
         if event not in self._callbacks:
             raise ValueError(f"Unknown event '{event}'. Valid: {sorted(self._callbacks)}")
         self._callbacks[event].append(callback)
+
+    def on_crossfade(self, cb: Callable):
+        """Register callback for knob 3 crossfade. Called with pos [0.0–1.0]."""
+        self._crossfade_cb = cb
 
     # ── Thread control ─────────────────────────────────────────────────────────
 
@@ -282,6 +288,16 @@ class PBF4Controller:
                 logger.error("[PBF4] Callback error '%s': %s", label, e)
 
     def _apply_continuous(self, label: str, raw: int, range_override):
+        if label == _CROSSFADE_LABEL:
+            pos = raw / 127.0
+            logger.debug("[PBF4] crossfade = %.3f", pos)
+            if self._crossfade_cb is not None:
+                try:
+                    self._crossfade_cb(pos)
+                except Exception as e:
+                    logger.error("[PBF4] crossfade callback error: %s", e)
+            return
+
         if label in _GENRE_LABELS:
             idx    = int(label[-1])
             scaled = raw / 127.0
@@ -320,7 +336,6 @@ class PBF4Controller:
         print("[PBF4 Status]")
         print(f"  guidance_weight = {p.guidance_weight:.2f}")
         print(f"  temperature     = {p.temperature:.2f}")
-        print(f"  topk            = {p.topk}")
         print(f"  model_feedback  = {p.model_feedback:.3f}")
         print(f"  genre_weights   = {[f'{w:.2f}' for w in gw]}")
         for lbl in _TOGGLE_LABELS:
