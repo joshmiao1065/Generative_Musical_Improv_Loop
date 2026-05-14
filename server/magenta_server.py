@@ -41,15 +41,9 @@ import numpy as np
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-GPU_TYPE     = "A100-40GB"   # 40GB has same compute as 80GB, wider availability on Modal
+GPU_TYPE     = "A100-80GB"   # model requires >40GB VRAM; 80GB confirmed working
 HF_CACHE_DIR = "/hf-cache"
 APP_NAME     = "magenta-rt-server"
-
-VOICE_STYLES = [
-    "Electric guitar, expressive, melodic",
-    "bass guitar",
-    "EDM synthesized drum machine",
-]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # IMAGE
@@ -101,13 +95,15 @@ app = modal.App(
 # This eliminates cold starts during sessions entirely.
 _CLS_KWARGS = dict(
     gpu=GPU_TYPE,
-    min_containers=1,
-    scaledown_window=600,
+    min_containers=0,
+    scaledown_window=300,
     timeout=600,
     env={
         "XLA_PYTHON_CLIENT_MEM_FRACTION": "0.85",
         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
         "HF_HOME": HF_CACHE_DIR,
+        "JAX_COMPILATION_CACHE_DIR": f"{HF_CACHE_DIR}/xla_cache",
+        "TF_GPU_ALLOCATOR": "cuda_malloc_async",
     },
 )
 
@@ -125,6 +121,13 @@ def _impl_load(self) -> None:
 
     t_start = _time.perf_counter()
 
+    # Persist XLA compilation cache to the HF volume so subsequent cold starts
+    # skip the 2-4 min JIT compile step.
+    try:
+        jax.config.update("jax_compilation_cache_dir", f"{HF_CACHE_DIR}/xla_cache")
+    except Exception:
+        pass  # older JAX versions use the env var instead
+
     sys.path.insert(0, "/root/src")
     from magenta_rt import spectrostream
     from magenta_backend import (
@@ -135,9 +138,8 @@ def _impl_load(self) -> None:
     self.CHUNK_SAMPLES = CHUNK_SAMPLES
     self.SAMPLE_RATE   = SAMPLE_RATE
 
-    style = VOICE_STYLES[self.VOICE_INDEX]
     devices = jax.devices()
-    print(f"[Voice {self.VOICE_INDEX}] Container started. GPU: {devices}. Style: '{style}'")
+    print(f"[Voice {self.VOICE_INDEX}] Container started. GPU: {devices}")
 
     print(f"[Voice {self.VOICE_INDEX}] Loading SpectroStream model...")
     t1 = _time.perf_counter()
@@ -150,16 +152,18 @@ def _impl_load(self) -> None:
     print(f"[Voice {self.VOICE_INDEX}] MagentaRT loaded in {_time.perf_counter()-t2:.1f}s")
 
     self.params = GenerationParams(
-        guidance_weight=1.5,
-        temperature=1.2,
-        topk=30,
-        model_feedback=0.95,
+        guidance_weight=3.0,
+        temperature=1.0,
+        topk=40,
+        model_feedback=0.7,
         model_volume=0.85,
         beats_per_loop=16,
         bpm=120,
     )
 
-    self.voice = AIVoice(self.model, self.ss_model, style, self.params)
+    # style=None defers embedding until the first generate_pass call,
+    # where embed_style(genre) is called with the per-voice genre string.
+    self.voice = AIVoice(self.model, self.ss_model, None, self.params)
     self._style_cache: dict = {}
 
     print(f"[Voice {self.VOICE_INDEX}] Running JIT warm-up (XLA compile, first time ~2-4 min)...")
@@ -169,7 +173,7 @@ def _impl_load(self) -> None:
     print(f"[Voice {self.VOICE_INDEX}] JIT compile done in {_time.perf_counter()-t3:.1f}s")
 
     total = _time.perf_counter() - t_start
-    print(f"[Voice {self.VOICE_INDEX}] *** READY *** ({style}) — total startup {total:.1f}s")
+    print(f"[Voice {self.VOICE_INDEX}] *** READY *** — total startup {total:.1f}s")
 
 
 def _impl_generate_pass(
@@ -178,13 +182,11 @@ def _impl_generate_pass(
     prior_mix_bytes: bytes,
     beats_per_loop: int = 16,
     bpm: int = 120,
-    guidance_weight: float = 1.5,
-    temperature: float = 1.2,
-    topk: int = 30,
-    model_feedback: float = 0.95,
-    genres: list = None,
-    instrument: str = "piano",
-    genre_weights: list = None,
+    guidance_weight: float = 3.0,
+    temperature: float = 1.0,
+    topk: int = 40,
+    model_feedback: float = 0.7,
+    genre: str = "jazz",
 ) -> bytes:
     import soundfile as sf
 
@@ -217,34 +219,13 @@ def _impl_generate_pass(
     self.params.beats_per_loop  = beats_per_loop
     self.params.bpm             = bpm
 
-    if genres and genre_weights:
-        active = [
-            (g, w) for g, w in zip(genres, genre_weights)
-            if g and w > 1e-4
-        ]
-        if active:
-            active_genres, active_weights = zip(*active)
-            ws = np.array(active_weights, dtype=np.float64)
-            ws /= ws.sum()
-
-            embeddings = []
-            for g in active_genres:
-                prompt = f"{g} {instrument}"
-                if prompt not in self._style_cache:
-                    print(f"Voice {self.VOICE_INDEX}: computing style embedding for '{prompt}'")
-                    self._style_cache[prompt] = self.model.embed_style(prompt)
-                embeddings.append(self._style_cache[prompt])
-
-            if len(embeddings) == 1:
-                blended = embeddings[0]
-            else:
-                blended = sum(float(w) * e for w, e in zip(ws, embeddings))
-
-            self.voice.style_embedding = blended
-            blend_desc = " + ".join(
-                f"{g}({w:.0%})" for g, w in zip(active_genres, ws)
-            )
-            print(f"Voice {self.VOICE_INDEX}: style = {blend_desc} {instrument}")
+    # Compute (or retrieve cached) style embedding for this genre.
+    # embed_style() returns a raw numpy/JAX array — do NOT access .embedding.
+    if genre not in self._style_cache:
+        print(f"Voice {self.VOICE_INDEX}: computing style embedding for '{genre}'")
+        self._style_cache[genre] = self.model.embed_style(genre)
+    self.voice.style_embedding = self._style_cache[genre]
+    print(f"Voice {self.VOICE_INDEX}: genre = '{genre}'")
 
     user_loop  = _load(user_loop_bytes)
     prior_mix  = _load(prior_mix_bytes)
@@ -281,12 +262,6 @@ def _impl_reset(self) -> None:
     print(f"Voice {self.VOICE_INDEX} state reset.")
 
 
-def _impl_prime(self) -> str:
-    dummy = np.zeros((self.CHUNK_SAMPLES, 2), dtype=np.float32)
-    self.voice.step(dummy)
-    return f"Voice {self.VOICE_INDEX} primed."
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # VOICE CLASSES
 # Three separate named classes so each can have min_containers=1.
@@ -309,18 +284,16 @@ class Voice0Server:
         prior_mix_bytes: bytes,
         beats_per_loop: int = 16,
         bpm: int = 120,
-        guidance_weight: float = 1.5,
-        temperature: float = 1.2,
-        topk: int = 30,
-        model_feedback: float = 0.95,
-        genres: list = None,
-        instrument: str = "piano",
-        genre_weights: list = None,
+        guidance_weight: float = 3.0,
+        temperature: float = 1.0,
+        topk: int = 40,
+        model_feedback: float = 0.7,
+        genre: str = "jazz",
     ) -> bytes:
         return _impl_generate_pass(
             self, user_loop_bytes, prior_mix_bytes,
             beats_per_loop, bpm, guidance_weight, temperature, topk,
-            model_feedback, genres, instrument, genre_weights,
+            model_feedback, genre,
         )
 
     @modal.method()
@@ -330,10 +303,6 @@ class Voice0Server:
     @modal.method()
     def reset(self) -> None:
         _impl_reset(self)
-
-    @modal.method()
-    def prime(self) -> str:
-        return _impl_prime(self)
 
 
 @app.cls(**_CLS_KWARGS)
@@ -351,18 +320,16 @@ class Voice1Server:
         prior_mix_bytes: bytes,
         beats_per_loop: int = 16,
         bpm: int = 120,
-        guidance_weight: float = 1.5,
-        temperature: float = 1.2,
-        topk: int = 30,
-        model_feedback: float = 0.95,
-        genres: list = None,
-        instrument: str = "piano",
-        genre_weights: list = None,
+        guidance_weight: float = 3.0,
+        temperature: float = 1.0,
+        topk: int = 40,
+        model_feedback: float = 0.7,
+        genre: str = "jazz",
     ) -> bytes:
         return _impl_generate_pass(
             self, user_loop_bytes, prior_mix_bytes,
             beats_per_loop, bpm, guidance_weight, temperature, topk,
-            model_feedback, genres, instrument, genre_weights,
+            model_feedback, genre,
         )
 
     @modal.method()
@@ -372,10 +339,6 @@ class Voice1Server:
     @modal.method()
     def reset(self) -> None:
         _impl_reset(self)
-
-    @modal.method()
-    def prime(self) -> str:
-        return _impl_prime(self)
 
 
 @app.cls(**_CLS_KWARGS)
@@ -393,18 +356,16 @@ class Voice2Server:
         prior_mix_bytes: bytes,
         beats_per_loop: int = 16,
         bpm: int = 120,
-        guidance_weight: float = 1.5,
-        temperature: float = 1.2,
-        topk: int = 30,
-        model_feedback: float = 0.95,
-        genres: list = None,
-        instrument: str = "piano",
-        genre_weights: list = None,
+        guidance_weight: float = 3.0,
+        temperature: float = 1.0,
+        topk: int = 40,
+        model_feedback: float = 0.7,
+        genre: str = "jazz",
     ) -> bytes:
         return _impl_generate_pass(
             self, user_loop_bytes, prior_mix_bytes,
             beats_per_loop, bpm, guidance_weight, temperature, topk,
-            model_feedback, genres, instrument, genre_weights,
+            model_feedback, genre,
         )
 
     @modal.method()
@@ -414,10 +375,6 @@ class Voice2Server:
     @modal.method()
     def reset(self) -> None:
         _impl_reset(self)
-
-    @modal.method()
-    def prime(self) -> str:
-        return _impl_prime(self)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

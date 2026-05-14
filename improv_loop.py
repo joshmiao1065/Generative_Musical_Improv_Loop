@@ -2,8 +2,8 @@
 improv_loop.py — Main session orchestrator for the Improv Loop system.
 
 Usage:
-    python improv_loop.py --bpm 120 --beats 16
-    python improv_loop.py --bpm 90 --beats 8 --voices 2
+    python improv_loop.py --bpm 120 --beats 16 --genres "jazz" "bossa nova" "electronic"
+    python improv_loop.py --bpm 90 --beats 8 --voices 2 --genres "blues" "ambient"
 
     # QWERTY keyboard fallback when PBF4 is not connected:
     python improv_loop.py --dry-run --qwerty
@@ -34,29 +34,31 @@ Usage:
     # Disable metronome click (silent count-in):
     python improv_loop.py --no-click
 
-    # Genre blending (style context passed to Modal each pass):
-    python improv_loop.py --genres "jazz" "blues" "electronic" "ambient" --instrument piano
-
 Controls (PBF4):
     Button 1  — record_toggle: first press starts count-in then records;
                 press while recording ends it early; press while playing restarts.
     Button 2  — voice_1_toggle: enable/disable AI Voice 1  (starts DISABLED)
     Button 3  — voice_2_toggle: enable/disable AI Voice 2  (starts DISABLED)
     Button 4  — voice_3_toggle: enable/disable AI Voice 3  (starts DISABLED)
-    Faders    — genre blend weights (passed to Modal as style context)
-    Knob 1    — guidance_weight  [0–10]
-    Knob 2    — temperature      [0–2]
-    Knob 3    — crossfade        [0–1] (0=you only, 0.5=both full, 1=AI only)
-    Knob 4    — model_feedback   [0–1]
+    Fader 1   — user loop volume [0–1]
+    Fader 2/3/4 — AI Voice 1/2/3 volume [0–1]
+    Knob 1    — EQ Bass   ±12 dB (shelf @ 250 Hz)
+    Knob 2    — EQ Mid    ±12 dB (peak @ 1 kHz)
+    Knob 3    — EQ Treble ±12 dB (shelf @ 4 kHz)
+    Knob 4    — Reverb wet [0–1]
+
+Controls (QWERTY, always active regardless of --qwerty flag):
+    4 / 5 / 6   — cycle genre for Voice 1 / 2 / 3 (wraps through --genres list)
+    ?           — print current genres and volumes
 
 Controls (--qwerty fallback, when PBF4 not connected):
     Space/Enter — record_toggle
     1 / 2 / 3   — toggle AI Voice 1 / 2 / 3
     q           — quit
     + / -       — guidance_weight ±0.5
-    t / T       — temperature ±0.1   k / K — crossfade ±0.1   f / F — model_feedback ±0.05
-    ] / [       — genre 0 weight ±0.1   ' / ; — genre 1   . / , — genre 2   M/m — genre 3
-    ?           — print current params
+    t / T       — temperature ±0.1
+    f / F       — model_feedback ±0.05
+    ?           — print current params + genres
 
 State machine:
     IDLE → [Button 1 / Space] → COUNTDOWN
@@ -64,6 +66,7 @@ State machine:
     COUNTDOWN → [Button 1] → IDLE
     RECORDING → [loop elapsed OR Button 1] → PLAYING
     PLAYING → [Button 1] → COUNTDOWN  (AI voices continue uninterrupted)
+    PLAYING → [Key 4/5/6] → cycle genre for Voice 1/2/3 (next pass)
     PLAYING → [Ctrl-C / q] → STOPPING → IDLE
 
 Synth routing (hardware — no code change needed when switching synths):
@@ -87,12 +90,12 @@ from typing import List, Optional
 import numpy as np
 
 # ── Project imports ───────────────────────────────────────────────────────────
-from src.audio_devices      import detect as detect_devices, list_devices, list_midi_ports
-from src.audio_mixer        import AudioMixer
-from src.loop_capture       import LoopCapture
-from src.midi_controller    import PBF4Controller
-from src.keyboard_controller import QwertyController
-from src.timing_engine      import TimingEngine
+from src.audio_devices       import detect as detect_devices, list_devices, list_midi_ports
+from src.audio_mixer         import AudioMixer
+from src.loop_capture        import LoopCapture
+from src.midi_controller     import PBF4Controller
+from src.keyboard_controller import QwertyController, GenreCycleThread
+from src.timing_engine       import TimingEngine
 
 # GenerationParams lives in magenta_backend but improv_loop doesn't need JAX.
 # Import it directly; if JAX isn't available on this machine, use the stub.
@@ -149,9 +152,10 @@ class ImprovSession:
             model_feedback=0.7,
         )
 
-        # Genre / style config (set once from CLI, weights updated live per pass)
-        self.genres:     List[str] = args.genres
-        self.instrument: str       = args.instrument
+        # Per-voice genres: initially genres[0..n_voices-1], cycled via 4/5/6 keys
+        self._voice_genres: List[str] = list(args.genres[:args.voices])
+        # Indices into args.genres for each voice — tracks position in cycling
+        self._genre_indices: List[int] = list(range(args.voices))
 
         # Current user loop audio (numpy array, set after first recording)
         self._user_loop: Optional[np.ndarray] = None
@@ -190,11 +194,11 @@ class ImprovSession:
         )
         self.capture = LoopCapture(
             device_idx=self.devs.capture_idx,
-            max_loop_seconds=64.0,
+            max_loop_seconds=25.0,
         )
         self.mixer = AudioMixer(
             device_idx=self.devs.playback_idx,
-            blocksize=512,
+            blocksize=256,
             on_loop_boundary=self._on_loop_boundary,
         )
         self.engine = TimingEngine(
@@ -218,11 +222,35 @@ class ImprovSession:
         self.ctrl.on("voice_1_toggle", lambda: self._handle_voice_toggle(0))
         self.ctrl.on("voice_2_toggle", lambda: self._handle_voice_toggle(1))
         self.ctrl.on("voice_3_toggle", lambda: self._handle_voice_toggle(2))
-        self.ctrl.on_crossfade(self.mixer.set_crossfade)
+
+        # Stem volume faders (PBF4 CC 36–39 / QWERTY has no equivalent)
+        self.ctrl.on_user_volume(self.mixer.set_user_volume)
+        for i in range(self.args.voices):
+            _i = i  # capture loop variable
+            self.ctrl.on_voice_volume(_i, lambda v, idx=_i: self.mixer.set_voice_volume(idx, v))
+
+        # EQ + reverb knobs (PBF4 CC 32–35 / QWERTY has no equivalent)
+        self.ctrl.on_eq_bass(self.mixer.effects.set_eq_bass)
+        self.ctrl.on_eq_mid(self.mixer.effects.set_eq_mid)
+        self.ctrl.on_eq_treble(self.mixer.effects.set_eq_treble)
+        self.ctrl.on_reverb_wet(self.mixer.effects.set_reverb_wet)
 
         # QwertyController fires "quit"; PBF4Controller does not have this event
         if hasattr(self.ctrl, "_callbacks") and "quit" in self.ctrl._callbacks:
             self.ctrl.on("quit", self._handle_quit)
+
+        # Genre cycling — always active regardless of --qwerty
+        if self.args.qwerty:
+            # QwertyController handles 4/5/6 directly
+            self.ctrl.on_genre_cycle(self._handle_genre_cycle)
+            self.ctrl.on_status(self._print_status)
+            self._genre_thread = None
+        else:
+            # GenreCycleThread provides always-on 4/5/6 when PBF4 is active
+            self._genre_thread = GenreCycleThread(
+                on_genre_cycle=self._handle_genre_cycle,
+                on_status=self._print_status,
+            )
 
         if not getattr(self.args, 'no_monitor', False):
             self.mixer.set_monitor(self.capture)
@@ -246,6 +274,8 @@ class ImprovSession:
         self.capture.start()
         self.mixer.start()
         self.ctrl.start()
+        if self._genre_thread is not None:
+            self._genre_thread.start()
 
         logger.info("[Session] Setup complete. BPM=%d  beats=%d  voices=%d  dry_run=%s",
                     self.args.bpm, self.args.beats, self.args.voices, self.args.dry_run)
@@ -286,6 +316,8 @@ class ImprovSession:
         self.mixer.stop()
         self.capture.stop()
         self.ctrl.stop()
+        if self._genre_thread is not None:
+            self._genre_thread.stop()
         self._aio_loop.call_soon_threadsafe(self._aio_loop.stop)
         logger.info("[Session] Goodbye.")
 
@@ -335,6 +367,28 @@ class ImprovSession:
         enabled = self.ctrl.get_toggle(label)
         self.mixer.set_voice_enabled(idx, enabled)
         logger.info("[Session] Voice %d: %s", idx + 1, "ON" if enabled else "OFF")
+
+    def _handle_genre_cycle(self, voice_idx: int):
+        """Cycle voice_idx's genre to the next entry in args.genres (wrapping)."""
+        genres = self.args.genres
+        if not genres:
+            return
+        self._genre_indices[voice_idx] = (self._genre_indices[voice_idx] + 1) % len(genres)
+        self._voice_genres[voice_idx] = genres[self._genre_indices[voice_idx]]
+        new_genre = self._voice_genres[voice_idx]
+        print(f"[Genre] Voice {voice_idx + 1}: {new_genre!r} (takes effect next pass)")
+        logger.info("[Session] Voice %d genre → %r", voice_idx + 1, new_genre)
+
+    def _print_status(self):
+        """Print current per-voice genres and mixer volumes."""
+        print("\n[Status]")
+        print(f"  User volume:  {self.mixer.user_volume:.2f}")
+        for i in range(self.args.voices):
+            genre   = self._voice_genres[i] if i < len(self._voice_genres) else "?"
+            vol     = self.mixer._voice_volume[i]
+            enabled = self.mixer._voice_enabled[i]
+            print(f"  Voice {i+1}: genre={genre!r}  volume={vol:.2f}  {'ON' if enabled else 'OFF'}")
+        print()
 
     # ── Timing callbacks ──────────────────────────────────────────────────────
 
@@ -434,19 +488,33 @@ class ImprovSession:
             print("\n" + "═" * 54)
             print("  ALL VOICES READY — Press Button 1 to record")
             print("═" * 54 + "\n")
+            # Start keepalive so containers don't scale down during idle/recording gaps.
+            # Pings every 60s — well within the 300s scaledown window.
+            asyncio.ensure_future(self._keepalive_loop())
         except Exception as e:
             logger.error("[Modal] Warm-up error: %s", e)
             self._containers_ready.set()
             print("\n[Modal] Warm-up had errors — check logs. Button 1 unblocked.\n")
 
+    async def _keepalive_loop(self):
+        """Ping all containers every 60s to hold the scaledown timer at bay."""
+        while not self._stop_event.is_set():
+            await asyncio.sleep(60)
+            if self._stop_event.is_set():
+                break
+            try:
+                await asyncio.gather(
+                    *[self.client._voices[i].ping.remote.aio()
+                      for i in range(self.args.voices)]
+                )
+                logger.debug("[Modal] Keepalive ping OK")
+            except Exception as e:
+                logger.debug("[Modal] Keepalive ping failed: %s", e)
+
     async def _generate_pass(self, user_loop: np.ndarray, pass_num: int):
         """Dispatch one generation pass (Modal or dry-run) and queue results into mixer."""
         try:
             p = self.params
-
-            genre_weights = self.ctrl.get_genre_weights()
-            logger.debug("[Session] Pass %d genre weights: %s", pass_num,
-                         [f"{w:.2f}" for w in genre_weights])
 
             if self.args.dry_run:
                 voice_outputs = self._dry_run_voices(user_loop)
@@ -455,6 +523,7 @@ class ImprovSession:
                                  self.args.dry_run_latency)
                     await asyncio.sleep(self.args.dry_run_latency)
             else:
+                logger.debug("[Session] Pass %d genres: %s", pass_num, self._voice_genres)
                 voice_outputs = await self.client.generate_pass(
                     user_loop,
                     guidance_weight=p.guidance_weight,
@@ -463,9 +532,7 @@ class ImprovSession:
                     model_feedback=p.model_feedback,
                     beats_per_loop=self.args.beats,
                     bpm=self.args.bpm,
-                    genres=self.genres,
-                    instrument=self.instrument,
-                    genre_weights=genre_weights,
+                    voice_genres=self._voice_genres,
                 )
 
             for i, audio in enumerate(voice_outputs):
@@ -537,16 +604,18 @@ class ImprovSession:
         ctrl   = "QWERTY keyboard" if qwerty else "PBF4"
         rec    = "Space/Enter" if qwerty else "Button 1"
         stop   = "q or Ctrl-C" if qwerty else "Ctrl-C"
-        genres_str = ", ".join(f"{g} ({w:.0%})" for g, w in
-                               zip(self.genres, self.ctrl.get_genre_weights()))
+        genres_str = "  ".join(
+            f"V{i+1}={self._voice_genres[i]!r}"
+            for i in range(self.args.voices)
+        )
         print()
-        print("=" * 62)
+        print("=" * 66)
         print("  Improv Loop — Ready")
         print(f"  BPM: {self.args.bpm}  Beats: {self.args.beats}  Voices: {self.args.voices}")
         print(f"  Controller: {ctrl}")
         print(f"  Capture:  [{self.devs.capture_idx}] {self.devs.capture_name}")
         print(f"  Playback: [{self.devs.playback_idx}] {self.devs.playback_name}")
-        print(f"  Instrument: {self.instrument}  Genres: {genres_str}")
+        print(f"  Genres: {genres_str}")
         if dry:
             print(dry)
         print()
@@ -555,8 +624,9 @@ class ImprovSession:
             print("  [1 / 2 / 3]  Toggle AI Voice 1 / 2 / 3  (start DISABLED)")
         else:
             print("  [Button 2/3/4]  Toggle AI Voice 1/2/3  (start DISABLED)")
+        print("  [4 / 5 / 6]  Cycle genre for Voice 1 / 2 / 3  (? = status)")
         print(f"  [{stop}]  Quit")
-        print("=" * 62)
+        print("=" * 66)
         print()
         if qwerty:
             print(f"  Waiting for Space/Enter key (QWERTY mode)...")
@@ -605,20 +675,18 @@ Examples:
                    help="Number of AI voices to use (default: 3)")
     p.add_argument("--qwerty", action="store_true",
                    help="Use QWERTY keyboard instead of PBF4. "
-                        "Space=record, 1/2/3=voices, q=quit, +/-=guidance, t/T=temp, "
-                        "k/K=crossfade, f/F=feedback, ]/[=genre0 ±0.1, etc. "
+                        "Space=record, 1/2/3=voices, 4/5/6=cycle genres, q=quit, "
+                        "+/-=guidance, t/T=temp, f/F=feedback, ?=status. "
                         "Named 'qwerty' to avoid confusion with the MIDI keyboard.")
 
-    # ── Style / genre blending ─────────────────────────────────────────────
-    style = p.add_argument_group("style / genre blending (passed to Modal each pass)")
+    # ── Per-voice genres ───────────────────────────────────────────────────
+    style = p.add_argument_group("per-voice genres (one genre per AI voice)")
     style.add_argument("--genres", nargs="+", metavar="GENRE",
-                       default=["jazz", "blues", "electronic", "ambient"],
-                       help="Genre names for style blending. PBF4 faders (or --qwerty keys "
-                            "]/[, ;/', ./,, M/m) set the blend weight for each genre. "
-                            "Up to 4 genres. (default: jazz blues electronic ambient)")
-    style.add_argument("--instrument", default="piano", metavar="INSTR",
-                       help="Instrument name appended to each genre to form the style prompt "
-                            "(e.g. 'jazz piano'). (default: piano)")
+                       default=["Electronic", "Hip Hop/ Rap", "Jazz"],
+                       help="Genre list. The first N genres are assigned to Voice 1/2/3. "
+                            "Press 4/5/6 to cycle any voice to the next genre in this list. "
+                            "Must have at least as many genres as --voices. "
+                            "(default: jazz 'bossa nova' electronic)")
 
     # ── Audio device routing ───────────────────────────────────────────────
     dev = p.add_argument_group("audio device routing")
@@ -667,15 +735,15 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    # Silently cap genres to 4 (PBF4 has 4 faders; QWERTY has 4 genre-weight pairs)
-    if len(args.genres) > 4:
+    # Ensure we have at least --voices genres; pad with the last genre if short
+    if len(args.genres) < args.voices:
+        last = args.genres[-1] if args.genres else "jazz"
         logging.getLogger(__name__).warning(
-            "[CLI] More than 4 genres specified; only the first 4 will be used."
+            "[CLI] Only %d genre(s) provided for %d voices — padding with %r",
+            len(args.genres), args.voices, last,
         )
-        args.genres = args.genres[:4]
-    # Pad genre weights to exactly 4 slots so get_genre_weights() always returns 4 values
-    while len(args.genres) < 4:
-        args.genres.append("")   # empty string = zero-weight genre (never blended)
+        while len(args.genres) < args.voices:
+            args.genres.append(last)
 
     # --list-devices: print device tables and exit (no session started)
     if args.list_devices:

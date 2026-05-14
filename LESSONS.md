@@ -309,6 +309,49 @@ Confirmed working: Surge XT timbre and pitch pass through correctly at ~10–20m
 
 ---
 
+## Effects Chain Design — Session 11 (2026-05-03)
+
+**Freeverb allpass buffers 2–4 are smaller than one audio block. "Read-all, write-all" is wrong.**
+Allpass buffer sizes at 48 kHz: 605, 480, 371, 245 samples (scaled from 44.1 kHz originals). The
+standard 512-sample audio block is larger than all but the first buffer. The naive block-processing
+approach — read all samples from the ring buffer at once, apply the allpass transform, write all
+back — fails when `block_size >= buf_len` because the buffer pointer wraps during the block, and a
+later sample's read should see the value written by an earlier sample in the same block. Concretely:
+with buf_len=245 and block_size=512, positions 0–244 are written in the first 245 samples, then
+positions 0–244 are read AGAIN for samples 245–489. The "read-all" approach reads the OLD values
+for the second pass, silently producing wrong output.
+**Fix**: sub-block at buffer-wrap boundaries. Each iteration processes `min(avail, n)` samples where
+`avail = buf_len - pos`. The buffer pointer never wraps within a sub-block. Verified by test in
+`scripts/test_effects_algorithms.py` (test_block_size_consistency passes with 22/22 tests).
+**Watch for**: comb filter buffers are all ≥ 1214 samples and are safe with the simple approach.
+Only allpass filters need the sub-block fix.
+
+**EQ parameter smoothing prevents clicks on fast knob sweeps.**
+Updating `scipy.signal.sosfilt` coefficients mid-stream while reusing the old `zi` state causes a
+transient at the coefficient boundary. For slow knob movements this is inaudible; for fast sweeps
+it produces a brief click. Standard fix: one-pole parameter smoother on the gain target with a
+τ ≈ 5 ms time constant (`coeff = exp(-2π × 200 / 48000) ≈ 0.9998`). Recompute filter coefficients
+only when the smoothed gain differs from the current filter's gain by > 0.01 dB. This prevents
+coefficient thrashing while still tracking fast knob movements within ~2 audio blocks.
+
+**Per-voice genres replace style blending; `embed_style` is called at generate-time, not init.**
+Previously, all three voices shared one blended style embedding computed from weighted genre text
+embeddings. This is replaced by: each voice has a dedicated genre string; `embed_style(genre)` is
+called once per `generate_pass` call on the Modal server. Call takes < 100 ms on GPU (MusicCoca
+text encoder) — negligible vs. the ~1.4s/chunk generation time. `VOICE_STYLES` in
+`magenta_server.py` is obsolete. The client now passes `genre: str` per voice call, not
+`genres`, `instrument`, and `genre_weights`.
+
+**Faders are now independent stem volume controls, not genre weight inputs.**
+CC 36 → user loop volume (0–1). CC 37/38/39 → AI voice 0/1/2 volume (0–1). The crossfader
+(`set_crossfade`, `_crossfade_ai`) has been removed from `AudioMixer`. The DJ-curve crossfader
+was musically useful but philosophically wrong: the user wanted to mix each stem separately, not
+trade off between "you" and "AI." Independent faders are more flexible and match standard
+multi-track thinking. The crossfader tests in `test_audio_logic.py` must be removed when
+`set_crossfade` is deleted.
+
+---
+
 ## Modal Architecture — Separate Classes Required (Session 9 — 2026-04-28)
 
 **`modal.parameter()` + `min_containers > 0` is unsupported. Use 3 separate named classes.**

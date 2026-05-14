@@ -34,71 +34,68 @@
       "note": "Button 4 (col 4 top) — enable/disable AI Voice 3"
     },
     {
-      "label": "genre_0",
+      "label": "user_volume",
       "channel": 0,
       "midi_type": "cc",
       "cc": 36,
       "type": "fader",
-      "note": "Fader 1 (col 1 middle) — genre blend weight 0 [0.0–1.0]"
+      "note": "Fader 1 (col 1 middle) — user loop stem volume [0.0–1.0]"
     },
     {
-      "label": "genre_1",
+      "label": "voice_0_volume",
       "channel": 0,
       "midi_type": "cc",
       "cc": 37,
       "type": "fader",
-      "note": "Fader 2 (col 2 middle) — genre blend weight 1 [0.0–1.0]"
+      "note": "Fader 2 (col 2 middle) — AI Voice 1 stem volume [0.0–1.0]"
     },
     {
-      "label": "genre_2",
+      "label": "voice_1_volume",
       "channel": 0,
       "midi_type": "cc",
       "cc": 38,
       "type": "fader",
-      "note": "Fader 3 (col 3 middle) — genre blend weight 2 [0.0–1.0]"
+      "note": "Fader 3 (col 3 middle) — AI Voice 2 stem volume [0.0–1.0]"
     },
     {
-      "label": "genre_3",
+      "label": "voice_2_volume",
       "channel": 0,
       "midi_type": "cc",
       "cc": 39,
       "type": "fader",
-      "note": "Fader 4 (col 4 middle) — genre blend weight 3 [0.0–1.0]"
+      "note": "Fader 4 (col 4 middle) — AI Voice 3 stem volume [0.0–1.0]"
     },
     {
-      "label": "guidance_weight",
+      "label": "eq_bass",
       "channel": 0,
       "midi_type": "cc",
       "cc": 32,
       "type": "knob",
-      "range": [0.0, 10.0],
-      "note": "Knob 1 (col 1 bottom) — CFG guidance strength"
+      "note": "Knob 1 (col 1 bottom) — EQ Bass ±12 dB low shelf @ 250 Hz. Center (CC 64) = 0 dB."
     },
     {
-      "label": "temperature",
+      "label": "eq_mid",
       "channel": 0,
       "midi_type": "cc",
       "cc": 33,
       "type": "knob",
-      "range": [0.0, 2.0],
-      "note": "Knob 2 (col 2 bottom) — sampling temperature"
+      "note": "Knob 2 (col 2 bottom) — EQ Mid ±12 dB peaking @ 1 kHz Q=0.707. Center (CC 64) = 0 dB."
     },
     {
-      "label": "crossfade",
+      "label": "eq_treble",
       "channel": 0,
       "midi_type": "cc",
       "cc": 34,
       "type": "knob",
-      "note": "Knob 3 (col 3 bottom) — user/AI crossfader: 0=you only, center=both full, 1=AI only"
+      "note": "Knob 3 (col 3 bottom) — EQ Treble ±12 dB high shelf @ 4 kHz. Center (CC 64) = 0 dB."
     },
     {
-      "label": "model_feedback",
+      "label": "reverb_wet",
       "channel": 0,
       "midi_type": "cc",
       "cc": 35,
       "type": "knob",
-      "range": [0.0, 1.0],
-      "note": "Knob 4 (col 4 bottom) — AI output self-feedback into context"
+      "note": "Knob 4 (col 4 bottom) — Reverb wet mix [0.0–1.0]. Full left = dry, full right = large hall."
     }
   ]
 }

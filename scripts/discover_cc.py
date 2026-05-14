@@ -24,7 +24,25 @@ print("\nListening for MIDI messages on ALL ports.")
 print("Move every knob and fader, then press every button on the PBF4.")
 print("Press Ctrl+C when done.\n")
 
-ports = [mido.open_input(p) for p in MIDI_PORTS]
+# Some controllers expose multiple virtual ports (e.g. intech Grid device 0 =
+# SysEx/config, device 1 = MIDI I/O). Skip ports that refuse to open.
+open_ports = []
+open_names = []
+for p in MIDI_PORTS:
+    try:
+        port_obj = mido.open_input(p)
+        open_ports.append(port_obj)
+        open_names.append(p)
+        print(f"  Opened: {p}")
+    except Exception as e:
+        print(f"  Skipped (cannot open): {p} — {e}")
+
+if not open_ports:
+    print("ERROR: no MIDI ports could be opened.")
+    raise SystemExit(1)
+
+MIDI_PORTS = open_names  # only the ones that opened
+ports = open_ports
 
 try:
     while True:

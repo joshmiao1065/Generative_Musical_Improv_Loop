@@ -23,9 +23,15 @@ Thread safety:
     - _loop_pos is read/written only by the audio callback thread.
 
 Volume:
-    Each voice has an independent gain (0.0–1.0) set by model_volume from
-    GenerationParams. The user loop plays at user_volume (default 1.0).
-    A simple peak-limiter prevents clipping on the final mix.
+    Each stem has an independent gain [0.0-1.0]:
+      - user_volume (CC 36): controls the user loop
+      - _voice_volume[0/1/2] (CC 37/38/39): controls each AI voice
+    A soft peak-limiter prevents clipping on the final mix.
+
+Effects:
+    An EffectsChain (3-band EQ + Freeverb reverb) is applied to the
+    full output mix after summing and before the limiter.
+    PBF4 knobs (CC 32-35) drive the EQ and reverb parameters.
 """
 
 import logging
@@ -35,6 +41,11 @@ from typing import Callable, List, Optional
 
 import numpy as np
 import sounddevice as sd
+
+try:
+    from src.effects_chain import EffectsChain
+except ImportError:
+    from effects_chain import EffectsChain  # when run as standalone script from src/
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +96,9 @@ class AudioMixer:
         # Buttons 2/3/4 on the PBF4 toggle each voice on/off.
         self._voice_enabled: List[bool] = [False, False, False]
 
-        # Crossfader — scales all AI voices together without overwriting per-voice
-        # model_volume. Applied multiplicatively in the callback.
-        # 0.0 = AI silent, 1.0 = AI at full model_volume. Default center (0.5→1.0).
-        self._crossfade_ai: float = 1.0
-
         self._stream: Optional[sd.OutputStream] = None
         self._boundary_lock = threading.Lock()  # guards on_loop_boundary swap
+        self.effects = EffectsChain()
 
         # Live input monitoring: when set, the capture stream is mixed directly
         # into the output so the user hears themselves while playing and recording.
@@ -179,17 +186,9 @@ class AudioMixer:
         """Set per-voice output gain [0.0–1.0]. Thread-safe (float write is atomic)."""
         self._voice_volume[voice_idx] = max(0.0, min(1.0, volume))
 
-    def set_crossfade(self, pos: float):
-        """DJ-style crossfader [0–1]. 0=user only, 0.5=both full, 1=AI only.
-
-        user_volume and _crossfade_ai each stay at 1.0 until the fader leaves
-        center, so the default knob position (center) is transparent.
-        """
-        pos = max(0.0, min(1.0, pos))
-        self.user_volume  = min(1.0, 2.0 * (1.0 - pos))
-        self._crossfade_ai = min(1.0, 2.0 * pos)
-        logger.debug("[AudioMixer] crossfade=%.2f  user=%.2f  ai=%.2f",
-                     pos, self.user_volume, self._crossfade_ai)
+    def set_user_volume(self, volume: float) -> None:
+        """Set user loop output gain [0.0–1.0]. Thread-safe (float write is atomic)."""
+        self.user_volume = max(0.0, min(1.0, volume))
 
     def set_monitor(self, capture, gain: float = 1.0):
         """
@@ -296,8 +295,7 @@ class AudioMixer:
                                    "skipping until next boundary", i, va.shape[0], loop_len)
                     continue
                 out[written:written + n] += (
-                    va[self._loop_pos:self._loop_pos + n]
-                    * (self._voice_volume[i] * self._crossfade_ai)
+                    va[self._loop_pos:self._loop_pos + n] * self._voice_volume[i]
                 )
 
             self._loop_pos += n
@@ -307,6 +305,9 @@ class AudioMixer:
             if self._loop_pos >= loop_len:
                 self._loop_pos = 0
                 self._on_boundary()
+
+        # Effects chain: 3-band EQ + reverb
+        out = self.effects.process(out)
 
         # Soft peak limiter — prevents clipping without hard distortion
         peak = np.max(np.abs(out))

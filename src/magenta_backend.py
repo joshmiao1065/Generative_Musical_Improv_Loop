@@ -239,20 +239,21 @@ class AIVoice:
         self,
         model: MagentaRTCFGTied,
         ss_model: spectrostream.SpectroStreamJAX,
-        style: str,
+        style: Optional[str],
         params: GenerationParams,
     ):
         """
         Args:
             model:    Loaded MagentaRTCFGTied instance (shared across all voices).
             ss_model: Loaded SpectroStreamJAX encoder (shared across all voices).
-            style:    Text description of this instrument, e.g. "jazz piano solo".
+            style:    Initial style text (e.g. "jazz"), or None to defer until first
+                      generate_pass (style_embedding will be set by the server).
             params:   GenerationParams instance (may be shared/mutated by MIDI thread).
         """
         self.model = model
         self.ss_model = ss_model
         self.params = params
-        self.style_embedding = model.embed_style(style)
+        self.style_embedding = model.embed_style(style) if style is not None else None
 
         cfg = model.config
         context_frames   = int(cfg.context_length * cfg.codec_frame_rate)

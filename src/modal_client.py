@@ -175,10 +175,8 @@ class MagentaRTClient:
         temperature: Optional[float] = None,
         topk: Optional[int] = None,
         model_feedback: Optional[float] = None,
-        # Genre blending — pass from session args + live fader weights
-        genres: Optional[List[str]] = None,
-        instrument: Optional[str] = None,
-        genre_weights: Optional[List[float]] = None,
+        # Per-voice genre strings — one per voice, cycled via QWERTY 4/5/6
+        voice_genres: Optional[List[str]] = None,
     ) -> list[np.ndarray]:
         """
         Generate one full loop pass for all voices simultaneously.
@@ -188,24 +186,19 @@ class MagentaRTClient:
         loop pass while the *current* pass is playing back.
 
         Args:
-            user_loop_np:   User loop audio as (N, 2) float32 numpy array at
-                            48kHz. Should be exactly beats_per_loop beats long.
-
+            user_loop_np: User loop audio as (N, 2) float32 numpy array at 48kHz.
             beats_per_loop, bpm, guidance_weight, temperature, topk,
-            model_feedback: Optional overrides for live PBF4 parameter updates.
-                            If None, uses the values from the previous call or
-                            the constructor defaults.
+            model_feedback: Optional live parameter overrides.
+            voice_genres:   Per-voice genre strings, e.g. ["jazz", "bossa nova",
+                            "electronic"]. If None, defaults to "jazz" for all voices.
 
         Returns:
-            List of N voice output arrays, each (M, 2) float32 at 48kHz where
-            M ≈ user_loop_np.shape[0] (one full loop worth of generated audio).
-            Voice 0 is at index 0, Voice 2 at index 2.
+            List of N voice output arrays, each (M, 2) float32 at 48kHz.
 
         Side effects:
             Saves returned outputs as self._prev_outputs for the next call's
             prior_mix computation.
         """
-        # Update params if caller passed new values (from PBF4 / QWERTY thread)
         if beats_per_loop  is not None: self.beats_per_loop  = beats_per_loop
         if bpm             is not None: self.bpm             = bpm
         if guidance_weight is not None: self.guidance_weight = guidance_weight
@@ -223,15 +216,12 @@ class MagentaRTClient:
         prior_mixes: list[np.ndarray] = []
         for i in range(self.n_voices):
             if i == 0 or self._prev_outputs[0] is None:
-                # Voice 0 always hears only user loop; silence for prior_mix
                 prior_mixes.append(_silence_like(user_loop_np))
             else:
-                # Sum all previous voices' prior outputs
                 mix = np.zeros_like(user_loop_np)
                 for j in range(i):
                     prev = self._prev_outputs[j]
                     if prev is not None:
-                        # Trim or pad prev to match user loop length
                         n = user_loop_np.shape[0]
                         if prev.shape[0] >= n:
                             mix += prev[:n]
@@ -241,10 +231,7 @@ class MagentaRTClient:
 
         prior_mix_bytes = [_np_to_wav_bytes(m) for m in prior_mixes]
 
-        # Resolve genre args — fall back to safe defaults if not provided
-        _genres        = genres        if genres        is not None else ["jazz", "piano solo"]
-        _instrument    = instrument    if instrument    is not None else "piano"
-        _genre_weights = genre_weights if genre_weights is not None else [1.0, 0.0, 0.0, 0.0]
+        _voice_genres = voice_genres if voice_genres is not None else ["jazz"] * self.n_voices
 
         # Dispatch all voices in parallel
         t0 = time.perf_counter()
@@ -258,9 +245,7 @@ class MagentaRTClient:
                 temperature=self.temperature,
                 topk=self.topk,
                 model_feedback=self.model_feedback,
-                genres=_genres,
-                instrument=_instrument,
-                genre_weights=_genre_weights,
+                genre=_voice_genres[i],
             )
             for i in range(self.n_voices)
         ]
@@ -292,58 +277,6 @@ class MagentaRTClient:
         await asyncio.gather(*tasks)
         self._prev_outputs = [None] * self.n_voices
         print("[MagentaRTClient] All voices reset.")
-
-    def reset_sync(self) -> None:
-        """Synchronous wrapper for reset(), for use in non-async contexts."""
-        asyncio.run(self.reset())
-
-    # ── Convenience: sync generate for simple scripts ─────────────────────────
-
-    def generate_pass_sync(
-        self,
-        user_loop_np: np.ndarray,
-        **kwargs,
-    ) -> list[np.ndarray]:
-        """
-        Synchronous wrapper for generate_pass().
-        For use in simple scripts or interactive testing.
-        Do NOT use inside an existing asyncio event loop.
-        """
-        return asyncio.run(self.generate_pass(user_loop_np, **kwargs))
-
-    # ── Mix utility ───────────────────────────────────────────────────────────
-
-    @staticmethod
-    def mix(
-        user_loop: np.ndarray,
-        voice_outputs: list[np.ndarray],
-        headroom: float = 0.95,
-    ) -> np.ndarray:
-        """
-        Mix user loop + all voice outputs into a normalized stereo output.
-
-        Args:
-            user_loop:     (N, 2) float32 user loop audio.
-            voice_outputs: list of (M, 2) float32 voice output arrays.
-            headroom:      Peak normalization target [0–1].
-
-        Returns:
-            (N, 2) float32 mixed audio, peak-normalized to headroom.
-        """
-        n = user_loop.shape[0]
-        mix = user_loop.copy()
-        for vo in voice_outputs:
-            # Trim or pad to user_loop length before mixing
-            if vo.shape[0] >= n:
-                mix += vo[:n]
-            else:
-                chunk = np.zeros_like(user_loop)
-                chunk[:vo.shape[0]] = vo
-                mix += chunk
-        peak = np.max(np.abs(mix))
-        if peak > 1e-6:
-            mix = mix * (headroom / peak)
-        return mix
 
 
 # ─────────────────────────────────────────────────────────────────────────────

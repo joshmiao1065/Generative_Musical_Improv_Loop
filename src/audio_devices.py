@@ -6,8 +6,9 @@ Priority order for capture:
   2. Stereo Mix at 48 kHz (built-in loopback — works but captures all speaker output)
 
 Priority order for playback:
-  1. WASAPI Speakers at 48 kHz (lowest latency, no resampling)
-  2. MME Speakers (fallback)
+  1. WASAPI Headphones at 48 kHz (aux output — auto-selected when connected)
+  2. WASAPI Speakers at 48 kHz (lowest latency, no resampling)
+  3. MME Speakers (fallback)
 
 Usage:
     from src.audio_devices import detect, AudioDevices
@@ -188,7 +189,19 @@ def _find_playback(
             f"Run with --list-devices to see all available devices."
         )
 
-    # 1. WASAPI Speakers at 48 kHz (lowest latency, no resampling)
+    # 1. WASAPI Headphones at 48 kHz (aux output — preferred when connected)
+    for idx, d in devs:
+        api_name = sd.query_hostapis(d["hostapi"])["name"]
+        if (
+            "wasapi" in api_name.lower()
+            and "headphone" in d["name"].lower()
+            and d["max_output_channels"] >= CHANNELS
+            and int(d["default_samplerate"]) == SAMPLE_RATE
+        ):
+            logger.info("[AudioDevices] WASAPI Headphones: [%d] %s", idx, d["name"])
+            return idx, d["name"]
+
+    # 2. WASAPI Speakers at 48 kHz (lowest latency, no resampling)
     for idx, d in devs:
         api_name = sd.query_hostapis(d["hostapi"])["name"]
         if (
@@ -200,7 +213,7 @@ def _find_playback(
             logger.info("[AudioDevices] WASAPI Speakers: [%d] %s", idx, d["name"])
             return idx, d["name"]
 
-    # 2. Any WASAPI output at 48 kHz
+    # 3. Any WASAPI output at 48 kHz
     for idx, d in devs:
         api_name = sd.query_hostapis(d["hostapi"])["name"]
         if (
@@ -211,7 +224,7 @@ def _find_playback(
             logger.info("[AudioDevices] WASAPI output: [%d] %s", idx, d["name"])
             return idx, d["name"]
 
-    # 3. MME Speakers (fallback — higher latency, may resample)
+    # 4. MME Speakers (fallback — higher latency, may resample)
     for idx, d in devs:
         if "speaker" in d["name"].lower() and d["max_output_channels"] >= CHANNELS:
             logger.warning("[AudioDevices] Falling back to MME: [%d] %s", idx, d["name"])

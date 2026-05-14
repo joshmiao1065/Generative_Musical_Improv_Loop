@@ -3,7 +3,7 @@
 > **Project**: Cooper Union — Generative Machine Learning, Final Project
 > **Developer**: Josh Miao
 > **GitHub**: https://github.com/joshmiao1065/Generative_Musical_Improv_Loop
-> **Last Updated**: 2026-04-29 (Session 10 — soundfile fix, _generation_in_flight gate, crossfader knob, memory leak fix in AIVoice, tests 22/22)
+> **Last Updated**: 2026-05-03 (Session 11 — redesign: per-voice genres, stem-volume faders, 3-band EQ + reverb knobs)
 
 ---
 
@@ -18,9 +18,11 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 6. Voice audio is trim/pad-corrected at each loop boundary — the strict shape check was a bug (now fixed)
 7. `pbf4_cc_map.json` has empty `cc_controls` — CC numbers were manually entered, must be verified with hardware
 8. Live monitoring passthrough uses `_MonitorFIFO` in `loop_capture.py` — do NOT revert to reading the last N frames from the ring buffer. That approach plays the same frames 4× when input blocksize (2048) > output blocksize (512), distorting pitch and timbre.
-9. `embed_style()` returns a **raw numpy/JAX array**, NOT a `StyleEmbedding` object. Do NOT access `.embedding` on it. For genre blending: `blended = sum(float(w) * e for w, e in zip(ws, embeddings))` — the result is a raw array, set directly as `self.voice.style_embedding = blended`.
-10. `_generation_in_flight` flag prevents queue buildup — only one Modal generation per voice set is dispatched at a time. If generation takes longer than one loop, subsequent passes are **intentionally skipped** (logged as WARNING). Do not remove this gate.
-11. Crossfader (Knob 3 / `k/K` key): `AudioMixer._crossfade_ai` is a separate multiplier applied on top of `_voice_volume[i]`. `queue_voice()` resets `_voice_volume[i]` on each boundary but does NOT touch `_crossfade_ai`. DJ curve: center = both full, hard-left = you only, hard-right = AI only.
+9. `_generation_in_flight` flag prevents queue buildup — only one Modal generation per voice set is dispatched at a time. If generation takes longer than one loop, subsequent passes are **intentionally skipped** (logged as WARNING). Do not remove this gate.
+10. **Effects chain — Freeverb allpass buffer sizes**: Allpass filters 2–4 have delay buffers of 480, 371, and 245 samples — ALL smaller than the standard 512-sample audio block. The vectorised "read-all, write-all" block approach is WRONG here because the buffer wraps within one block, and a later position should read the value written earlier in the same block. **Correct fix**: sub-block at buffer-wrap boundaries (process `min(avail, n)` samples per iteration). See `src/effects_chain.py` and `scripts/test_effects_algorithms.py`. Comb filter buffers (all ≥ 1214 samples) are safe with the simple approach.
+11. **Per-voice genres (NOT blended)**: Each of the 3 AI voices generates a dedicated genre. The server receives a `genre: str` per call and computes `embed_style(genre)` at call time. There is no blending. `VOICE_STYLES` in `magenta_server.py` is obsolete — do not use it.
+12. **Faders are now stem volume controls** (NOT genre weights): CC 36 = user loop volume, CC 37/38/39 = AI voice 0/1/2 volume. There is no crossfader. `set_crossfade()` and `_crossfade_ai` have been removed from `AudioMixer`.
+13. **EQ knobs modify filter coefficients mid-stream**: When a gain parameter changes, `sosfilt_zi` state from the old filter is reused with new coefficients. This causes a brief transient (< 5 samples). A one-pole smoother on the gain target eliminates audible clicks — do NOT skip it.
 
 ---
 
@@ -30,20 +32,20 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 [MicroLab mk3]  ──USB-C MIDI──▶ [ThinkPad]  (musical input only — 25 keys, no knobs)
 [intech PBF4]   ──USB MIDI───▶ [ThinkPad]  (ALL parameter control)
 [Surge XT]      ──audio──▶ VB-Cable "CABLE Input" ──▶ Python captures "CABLE Output"
-[ThinkPad]      ──asyncio HTTP──▶ Modal.com (3× A100-40GB, one per AI voice)
+[ThinkPad]      ──asyncio HTTP──▶ Modal.com (3× A100-80GB, one per AI voice)
 [ThinkPad]      ──audio──▶ speakers (Python mixes live monitoring + user loop + AI voices)
 ```
 
 **Session flow:**
 1. `modal deploy server/magenta_server.py` — deploy (containers begin warming immediately, ~5–8 min first boot)
 2. Watch improv_loop terminal for `ALL VOICES READY` (printed when all ping calls return)
-3. `python improv_loop.py --bpm 120 --beats 16` — starts script, Button 1 locked until containers confirm warm
+3. `python improv_loop.py --bpm 120 --beats 16 --genres "jazz" "bossa nova" "electronic"` — starts script
 4. PBF4 Button 1 → 2-bar countdown → record user loop
-3. Loop plays; AI voices generate in parallel (buffer pass architecture)
-4. AI voices join one by one (Voice 1 at pass 3, Voice 2 at pass 5, Voice 3 at pass 7)
-5. PBF4 knobs/faders adjust live generation params
-6. PBF4 Button 1 again → re-record; AI continues uninterrupted
-7. PBF4 Button 2 → graceful stop
+5. Loop plays; AI voices generate in parallel (buffer pass architecture)
+6. AI voices join one by one (Voice 1 at pass 2, Voice 2 at pass 3, Voice 3 at pass 4)
+7. PBF4 faders adjust stem volumes; knobs shape EQ/reverb on full mix
+8. PBF4 Button 1 again → re-record; AI continues uninterrupted
+9. QWERTY keys `4`/`5`/`6` cycle genre for Voice 1/2/3 (takes effect next generation pass)
 
 ---
 
@@ -51,12 +53,23 @@ Read this file AND `LESSONS.md` before writing any code. After every session, up
 
 **12 controls: 4 buttons (top) × 4 faders (middle) × 4 knobs (bottom)**
 
-| Column | Button | Fader | Knob |
-|--------|--------|-------|------|
-| 1 | Record start/restart | Genre 1 weight | `guidance_weight` [0–10] |
-| 2 | Stop session | Genre 2 weight | `temperature` [0–2] |
-| 3 | Enable AI Voice 3 | Genre 3 weight | `crossfade` [0–1] (0=you, 0.5=both, 1=AI) |
-| 4 | Enable AI Voice 4 | Genre 4 weight | `model_feedback` [0–1] |
+| Column | Button | Fader (CC 36–39) | Knob (CC 32–35) |
+|--------|--------|------------------|-----------------|
+| 1 | Record / Re-record | User track volume [0–1] | EQ Bass ±12 dB (shelf @ 250 Hz) |
+| 2 | Toggle AI Voice 1 on/off | AI Voice 1 volume [0–1] | EQ Mid ±12 dB (peak @ 1 kHz) |
+| 3 | Toggle AI Voice 2 on/off | AI Voice 2 volume [0–1] | EQ Treble ±12 dB (shelf @ 4 kHz) |
+| 4 | Toggle AI Voice 3 on/off | AI Voice 3 volume [0–1] | Reverb wet [0–1] |
+
+**Knob semantics:**
+- Knob center (CC value 64) = 0 dB / flat for all EQ bands. Full left (CC 0) = −12 dB. Full right (CC 127) = +12 dB.
+- Reverb knob: full left = dry, full right = large wet room (room_size ≈ 0.98, wet mix ≈ 0.8). Applied to entire output mix.
+- EQ and reverb are processed locally in the audio callback (Python/numpy). Never route these to Modal.
+
+**Genre cycling (QWERTY, always active regardless of --qwerty flag):**
+- `4` → cycle Voice 1 to next genre in `--genres` list
+- `5` → cycle Voice 2
+- `6` → cycle Voice 3
+- `?` → print current genres and volumes
 
 **⚠ CC NUMBERS ENTERED MANUALLY — MUST VERIFY WITH HARDWARE:**
 `config/pbf4_cc_map.json` has empty `cc_controls` — only buttons were captured during
@@ -97,9 +110,9 @@ App URL: https://modal.com/apps/joshuamiao03/main/deployed/magenta-rt-server
 - 16-beat pass @ 120 BPM: 5.68s gen / 8.0s loop = **0.71×** ✓ (2.32s headroom)
 - Cost: ~$7.50/hr for 3 voices active.
 
-**Current GPU: A100-40GB** (switched from 80GB in Session 9 — better availability on account tier; same Ampere compute, slightly less bandwidth. Benchmark not yet re-run on 40GB. A10G is NOT viable — RTF 0.873× means it always takes longer to generate than the loop duration regardless of settings.)
+**Current GPU: A100-80GB** (A100-40GB attempted in Session 9 but OOMs — model's LLM computation graph requires >40GB VRAM, confirmed by XLA rematerialization failure on 2026-04-29. A10G is NOT viable — RTF 0.873× means it always takes longer to generate than the loop duration regardless of settings.)
 
-**Architecture (locked):** Three separate named Modal classes — `Voice0Server`, `Voice1Server`, `Voice2Server` — each with `min_containers=1`. Containers warm on `modal deploy`, no prime step required. One A100-40GB container per voice. All 3 called in parallel via `asyncio.gather`. One-pass lag between voices is intentional. See `src/modal_client.py` and `server/magenta_server.py`.
+**Architecture (locked):** Three separate named Modal classes — `Voice0Server`, `Voice1Server`, `Voice2Server` — each with `min_containers=1`. Containers warm on `modal deploy`, no prime step required. One A100-80GB container per voice. All 3 called in parallel via `asyncio.gather`. One-pass lag between voices is intentional. See `src/modal_client.py` and `server/magenta_server.py`.
 
 **Cold boot sequence per container (~5–8 min total on first deploy):**
 1. GPU allocated, Python process starts → container shows "active" on dashboard
@@ -115,18 +128,19 @@ To stream container logs:
 modal logs magenta-rt-server
 ```
 
-**CONFIRMED Parameters** (all map to PBF4 knobs):
+**Generation parameters** (all sent from client on each pass):
 
-| kwarg | Type | Range | PBF4 |
-|-------|------|-------|------|
-| `guidance_weight` | float | 0–10 | Knob 1 |
-| `temperature` | float | 0–2 | Knob 2 |
-| `topk` | int | 0–1024 | (fixed at default 30 — Knob 3 replaced by crossfader) |
-| `model_feedback` | float | 0–1 | Knob 4 |
-| `model_volume` | float | 0–1 | fixed |
+| kwarg | Type | Range | Control |
+|-------|------|-------|---------|
+| `guidance_weight` | float | 0–10 | fixed at 3.0 (was Knob 1 — now knobs are EQ/reverb) |
+| `temperature` | float | 0–2 | fixed at 1.0 |
+| `topk` | int | 0–1024 | fixed at 40 |
+| `model_feedback` | float | 0–1 | fixed at 0.7 |
+| `genre` | str | any text | per-voice, cycled via QWERTY 4/5/6 |
 | `bpm` | int | 60–200 | from CLI |
 | `beats_per_loop` | int | 1–64 | from CLI |
-| `crossfade` | float | 0–1 | Knob 3 (mixer, not Modal param) |
+
+**Note on genre**: `embed_style(genre)` is called at the start of each `generate_pass` on the Modal server. This runs the MusicCoca text encoder (< 100ms on GPU). The result is a raw numpy array — do NOT access `.embedding` on it. Pass it directly to `generate_chunk(style=...)`.
 
 **Lyria RealTime API: ELIMINATED.** Text-only input, no audio injection. Do not revisit.
 **Colab: ELIMINATED.** Session disconnects, no persistent URL. Modal is the sole deployment target.
@@ -147,7 +161,11 @@ Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream 
                                               │                             │
                                      numpy decode ◀──────────────────────┐  │
                                               │                           │  │
-                                   Python OutputStream: live monitoring + user_loop + AI mix → speakers
+                                   Python OutputStream: live monitoring + user_loop + AI mix
+                                              │
+                                        EffectsChain (3-band EQ → Freeverb)
+                                              │
+                                          → speakers
 ```
 
 **VB-Cable setup** (Windows, one-time, CONFIRMED WORKING 2026-04-26):
@@ -168,15 +186,7 @@ Surge XT → "CABLE Input" (VB-Cable) → "CABLE Output" → Python InputStream 
 **Live monitoring (CONFIRMED WORKING 2026-04-28):** The `_MonitorFIFO` in `loop_capture.py`
 streams captured audio directly to `AudioMixer`'s output callback. Player hears themselves
 through speakers with ~10–20ms latency at all times (idle, recording, and playback). Disable
-with `--no-monitor` if needed. Implementation note: a simple "read last N frames" approach does
-NOT work when input blocksize (2048) ≠ output blocksize (512) — it plays the same 512 frames
-4× per input block, distorting pitch and timbre. The FIFO drains correctly regardless of block sizes.
-
-**Audio format**: All internal audio is `(N, 2) float32 @ 48000 Hz`. WAV bytes over Modal are 24-bit PCM.
-
-**Without VB-Cable (Stereo Mix fallback)**: Works for initial testing, but captures ALL speaker
-audio. AI voice output bleeds back into the capture stream → fed to Modal → model responds to
-its own output. Quality degrades over time. For testing only — do not use in production sessions.
+with `--no-monitor` if needed.
 
 **Audio format**: All internal audio is `(N, 2) float32 @ 48000 Hz`. WAV bytes over Modal are 24-bit PCM.
 
@@ -199,8 +209,9 @@ improv_loop/
 ├── src/
 │   ├── magenta_backend.py      # ✓ AIVoice, MagentaRTCFGTied, GenerationParams
 │   ├── modal_client.py         # ✓ MagentaRTClient — async parallel voice dispatch
-│   ├── midi_controller.py      # ✓ PBF4Controller — CC→GenerationParams, button callbacks
-│   ├── audio_mixer.py          # ✓ AudioMixer — voice enable/disable + shape trim/pad fixed
+│   ├── midi_controller.py      # ✓ PBF4Controller — CC→volume/EQ/reverb, button callbacks
+│   ├── audio_mixer.py          # ✓ AudioMixer — voice enable/disable + shape trim/pad
+│   ├── effects_chain.py        # ✓ EffectsChain — 3-band EQ (RBJ biquad) + Freeverb reverb
 │   ├── audio_devices.py        # ✓ device auto-detect + list_devices() + VB-Cable helper
 │   ├── loop_capture.py         # ✓ ring buffer capture with beat-aligned snapshot
 │   └── timing_engine.py        # ✓ perf_counter pass-boundary clock + metronome
@@ -209,13 +220,12 @@ improv_loop/
 ├── scripts/
 │   ├── discover_cc.py          # ✓ interactive CC discovery → pbf4_cc_map.json
 │   ├── prime_server.py         # ✓ warm up deployed Modal containers
-│   ├── test_audio_logic.py     # ✓ unit tests (runs in WSL, no hardware required)
+│   ├── test_audio_logic.py     # ✓ unit tests for AudioMixer (runs in WSL, no hardware)
+│   ├── test_effects_algorithms.py  # ✓ EQ + Reverb algorithm validation (22 tests, all pass)
 │   └── validate_pbf4.py        # ✓ live param readout — run after filling pbf4_layout.json
 ├── CLAUDE.md                   # this file
 └── LESSONS.md                  # bugs and lessons — READ BEFORE CODING
 ```
-
-**All core components built and tested.** Ready for end-to-end hardware testing.
 
 **To run a session:**
 ```bat
@@ -227,7 +237,7 @@ REM List devices to confirm VB-Cable and PBF4 are visible:
 
 REM Real session with Modal:
 modal deploy server/magenta_server.py   # one-time deploy (already done)
-.venv\Scripts\python improv_loop.py --bpm 120 --beats 16
+.venv\Scripts\python improv_loop.py --bpm 120 --beats 16 --genres "jazz" "bossa nova" "electronic"
 ```
 Then press Button 1 on the PBF4 to start. Press Buttons 2/3/4 to enable AI voices.
 
@@ -243,11 +253,9 @@ Then press Button 1 on the PBF4 to start. Press Buttons 2/3/4 to enable AI voice
 |------|-----------|------------|
 | 0 | countdown + recording | — |
 | 1 | user_loop | Voice 0 generating |
-| 2 | user_loop (buffer) | Voice 0 done; Voice 1 generating |
-| 3 | user_loop + Voice 0 | Voice 1 generating |
-| 4 | user_loop + V0 (buffer) | Voice 1 done; Voice 2 generating |
-| 5 | user_loop + V0 + V1 | Voice 2 generating |
-| 6+ | all 3 voices live | next pass generating |
+| 2 | user_loop + Voice 0 | Voice 0 done; Voice 1 generating |
+| 3 | user_loop + V0 + V1 | Voice 1 done; Voice 2 generating |
+| 4+ | all 3 voices live | next pass generating |
 
 **Parallel dispatch**: All active voices called simultaneously via `asyncio.gather`. Wall time = max(V0, V1, V2) ≈ 5.68s, not their sum.
 
@@ -260,51 +268,90 @@ Then press Button 1 on the PBF4 to start. Press Buttons 2/3/4 to enable AI voice
 ```
 IDLE → [Button 1] → COUNTDOWN (2-bar metronome)
 COUNTDOWN → [2 bars elapsed] → RECORDING
-COUNTDOWN → [Button 2] → IDLE
+COUNTDOWN → [Button 1] → IDLE
 RECORDING → [N bars elapsed] → PLAYING (loop captured, generation starts)
-PLAYING → [Button 1] → COUNTDOWN_RERECORD (AI voices continue uninterrupted)
-PLAYING → [Button 2] → STOPPING
-PLAYING → [Button 3] → enable Voice 3 (stays PLAYING)
-PLAYING → [Button 4] → enable Voice 4 (stays PLAYING)
+PLAYING → [Button 1] → COUNTDOWN  (AI voices continue uninterrupted)
+PLAYING → [Button 2/3/4] → toggle Voice 1/2/3 on/off (stays PLAYING)
+PLAYING → [Key 4/5/6] → cycle genre for Voice 1/2/3 (takes effect next pass)
 PLAYING → [pass boundary] → swap double buffer if pending loop exists
-COUNTDOWN_RERECORD → [2 bars] → RERECORDING
-RERECORDING → [N bars] → PLAYING (new loop swapped in atomically)
-STOPPING → [fade + close] → IDLE
+PLAYING → [Ctrl-C / q] → STOPPING → IDLE
 ```
 
 ---
 
-## 8. Genre Blending
+## 8. Per-Voice Genres
 
-PBF4 faders control `genre_weights[0..3]` (0.0–1.0 each). Style prompt is built each pass:
-- Weighted text embeddings: `style = Σ(weight_i × embed(f"{genre_i} {instrument}"))` normalized
-- Fallback single prompt: `"jazz piano: heavy jazz, light blues"` from weights
+Each of the 3 AI voices is assigned a dedicated genre (text string). Genres do NOT blend.
 
-Genre list and instrument list configurable at CLI: `--genres "jazz" "blues" --instruments "piano" "bass" "drums"`
+**Initial assignment:** From `--genres` CLI arg (3+ strings). Voice 0 starts with `genres[0]`, Voice 1 with `genres[1]`, Voice 2 with `genres[2]`.
+
+**Genre cycling:** QWERTY keys `4`/`5`/`6` cycle the genre for Voice 1/2/3 through the full `--genres` list (wrapping). Change takes effect on the next generation pass (not the current one in flight).
+
+**Server-side:** Each VoiceServer's `generate_pass` receives `genre: str` and computes `embed_style(genre)` at call time. The style embedding is a raw numpy/JAX array — set directly as `self.voice.style_embedding`. Do NOT access `.embedding` on it.
+
+**Example genres:** "jazz", "bossa nova", "electronic", "ambient", "blues", "classical", "lo-fi hip hop", "drum and bass". Magenta RT understands natural-language style descriptors. Longer descriptors (e.g. "smooth jazz with upright bass") work too.
 
 ---
 
-## 9. Open Questions
+## 9. Effects Chain (`src/effects_chain.py`)
+
+All effects are applied to the **full output mix** (user loop + all AI voices + monitoring) inside the audio callback, after mixing and before the peak limiter. Processing budget: ~512 samples / 10ms per callback.
+
+### 3-Band EQ (CC 32, 33, 34)
+
+Implemented using RBJ Audio EQ Cookbook biquad filters (second-order sections, scipy.signal.sosfilt):
+
+| Band | Filter type | Center freq | Knob center | Knob range |
+|------|------------|-------------|-------------|------------|
+| Bass (CC 32) | Low shelf | 250 Hz | 0 dB | −12 to +12 dB |
+| Mid (CC 33) | Peaking EQ | 1000 Hz, Q=0.707 | 0 dB | −12 to +12 dB |
+| Treble (CC 34) | High shelf | 4000 Hz | 0 dB | −12 to +12 dB |
+
+**Parameter smoothing**: Each band uses a one-pole smoother on the gain parameter (τ ≈ 5ms, `coeff = exp(-2π × 200/48000)`). This prevents audible clicks when the knob is swept quickly. Filter coefficients are only recomputed when the smoothed gain differs from the current filter's gain by > 0.01 dB.
+
+**State continuity**: The `zi` (filter state) from the previous buffer is reused with new coefficients. The resulting transient is < 5 samples and inaudible in practice.
+
+### Reverb (CC 35) — Freeverb algorithm
+
+Freeverb (Jezar at Dreampoint, public domain) — 8 parallel feedback comb filters + 4 series all-pass filters per channel.
+
+**Delay buffer sizes at 48 kHz (scaled from original 44.1 kHz):**
+- Comb filters L: 1214, 1293, 1390, 1475, 1547, 1622, 1694, 1759 (all > block size ✓)
+- Comb filters R: +25 samples offset from L (stereo width)
+- Allpass filters: 605, 480, 371, 245 (last three < 512-sample block — requires sub-block processing)
+
+**Allpass implementation**: Must sub-block at buffer-wrap boundaries because buffers 2–4 are smaller than one audio block. See CRITICAL NOTICE item 10 and `scripts/test_effects_algorithms.py`.
+
+**Knob mapping (CC 35, range 0.0–1.0):**
+- 0.0: fully dry (reverb bypassed)
+- 0.5: medium room, ~20% wet
+- 1.0: large hall, ~80% wet, room_size = 0.98
+
+---
+
+## 10. Open Questions
 
 | # | Question | Status |
 |---|----------|--------|
 | 1 | PBF4 actual CC numbers for knobs/faders? | **⚠ OPEN** — `cc_controls` in pbf4_cc_map.json is empty; re-run discover_cc.py and move all knobs/faders |
 | 2 | Beat-alignment preference? | **⚠ OPEN** — free improv (accept drift) vs beat-locked (trim to boundary)? |
-| 3 | How many genres must be specified? | **⚠ OPEN** — 2 genres with 2 faders unused OK? |
-| 4 | Analog Lab routing confirmed? | **⚠ OPEN** — documented (standalone → CABLE Input) but not yet tested; Surge XT is confirmed working |
-| 5 | VB-Cable installed? | **✓ RESOLVED** — installed 2026-04-26, device [2], 48kHz stereo, WASAPI shared mode |
-| 6 | A100-40GB real-time benchmark post-soundfile-fix? | **⚠ OPEN** — librosa→soundfile fix reduces server-side overhead by ~1-2s. Expected RTF now ~0.7-0.9× (well under 1.0×). Need to measure with a real session. |
-| 7 | Genre blending with raw embedding arrays? | **⚠ OPEN** — `embed_style()` returns raw numpy array. Blending via `sum(w*e)` gives a raw array. Does `style_model.tokenize(raw_array)` work inside `generate_chunk`? Only testable on Modal. |
-| 8 | Crossfader Knob 3 pickup at startup? | **⚠ OPEN** — PBF4 doesn't send CC until knob is moved; mixer defaults to `_crossfade_ai=1.0` (AI full). Fine until user moves knob, then it jumps to the physical position. First move is a jump not a sweep. |
+| 3 | Analog Lab routing confirmed? | **⚠ OPEN** — documented but not yet tested; Surge XT is confirmed working |
+| 4 | VB-Cable installed? | **✓ RESOLVED** — installed 2026-04-26, device [2], 48kHz stereo, WASAPI shared mode |
+| 5 | A100-80GB real-time benchmark post-soundfile-fix? | **⚠ OPEN** — librosa→soundfile fix reduces overhead. Expected RTF ~0.7× (well under 1.0×). Measure with a real session. |
+| 6 | Per-voice genre style embedding correctness? | **⚠ OPEN** — `embed_style(genre)` called per pass. Does passing a short genre string ("jazz") produce a musically coherent embedding vs. the previous instrument description ("jazz piano solo")? Only testable on Modal. |
+| 7 | EQ/reverb overhead in audio callback? | **⚠ OPEN** — estimated < 2ms for 512-sample block. Verify with `time.perf_counter()` profiling in first session. |
+| 8 | Genre cycling key pickup at startup? | **⚠ OPEN** — QWERTY genre-cycle thread always runs; confirm it doesn't interfere with PBF4 mode or generate spurious input on some terminals. |
 
 ---
 
-## 10. Key Docs
+## 11. Key Docs
 
 | Resource | URL |
 |----------|-----|
 | Magenta RT GitHub | https://github.com/magenta/magenta-realtime |
 | Audio Injection notebook | https://colab.research.google.com/github/magenta/magenta-realtime/blob/main/notebooks/Magenta_RT_Audio_Injection.ipynb |
+| RBJ Audio EQ Cookbook | https://www.w3.org/2011/audio/audio-eq-cookbook.html |
+| Freeverb source (Jezar) | https://ccrma.stanford.edu/~jos/pasp/Freeverb.html |
 | Modal docs | https://modal.com/docs |
 | VB-Cable | https://shop.vb-audio.com/en/win-apps/11-vb-cable.html |
 | Surge XT | https://surge-synthesizer.github.io/ |
@@ -314,7 +361,7 @@ Genre list and instrument list configurable at CLI: `--genres "jazz" "blues" --i
 
 ---
 
-## 11. Dependencies
+## 12. Dependencies
 
 **Client (ThinkPad) — `requirements.txt`**:
 ```
@@ -322,7 +369,7 @@ mido>=1.3.0
 python-rtmidi>=1.5.8
 sounddevice>=0.4.6
 numpy>=1.26.0
-librosa>=0.10.0
+scipy>=1.10.0
 soundfile>=0.12.0
 modal>=0.73.0
 ```

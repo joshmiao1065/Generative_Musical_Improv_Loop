@@ -96,17 +96,6 @@ class TimingEngine:
         # Metronome click injection — set by caller before start_countdown
         self._mixer_queue_fn: Optional[Callable] = None  # mixer.queue_voice or direct inject
 
-    # ── Configuration ──────────────────────────────────────────────────────────
-
-    def set_tempo(self, bpm: float, beats_per_loop: int):
-        """Update tempo and loop length (takes effect on next pass)."""
-        self.bpm            = bpm
-        self.beats_per_loop = beats_per_loop
-        self._beat_dur      = 60.0 / bpm
-        self._loop_dur      = beats_per_loop * self._beat_dur
-        logger.info("[Timing] Tempo updated: %.1f BPM, %d beats (%.2fs loop)",
-                    bpm, beats_per_loop, self._loop_dur)
-
     def set_click_output(self, fn: Callable[[np.ndarray], None]):
         """
         Register a function that receives click audio chunks (N, 2) float32.
@@ -221,26 +210,6 @@ class TimingEngine:
             if abs(drift) > 0.010:  # >10ms drift — re-anchor
                 self._anchor += drift
                 logger.debug("[Timing] Re-anchored: drift was %.1f ms", drift * 1000)
-
-    # ── Position query ─────────────────────────────────────────────────────────
-
-    def beat_phase(self) -> float:
-        """
-        Current position within the loop as a fraction [0.0, 1.0).
-        0.0 = start of loop, 0.5 = halfway through.
-        Returns 0.0 if not yet started.
-        """
-        if self._anchor is None:
-            return 0.0
-        elapsed = (time.perf_counter() - self._anchor) % self._loop_dur
-        return elapsed / self._loop_dur
-
-    def current_beat(self) -> int:
-        """Current beat number within the loop (0-indexed)."""
-        if self._anchor is None:
-            return 0
-        elapsed = (time.perf_counter() - self._anchor) % self._loop_dur
-        return int(elapsed / self._beat_dur)
 
     @property
     def loop_duration(self) -> float:

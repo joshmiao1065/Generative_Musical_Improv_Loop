@@ -3,9 +3,8 @@ midi_controller.py — PBF4 live MIDI input handler.
 
 Runs a background daemon thread that:
   - Reads CC and note_on messages from the intech PBF4
-  - CC messages (knobs/faders) → GenerationParams fields, scaled to physical ranges
+  - CC messages (knobs/faders) → registered callbacks, scaled to physical ranges
   - Note_on messages (buttons) → fires registered callbacks + manages toggle state
-  - Writes genre_weights[0..3] for style prompt blending each pass
 
 Hardware facts (confirmed 2026-04-21):
   - Port name: "Intech Grid MIDI device 0"
@@ -13,26 +12,36 @@ Hardware facts (confirmed 2026-04-21):
   - Faders (col 1–4 middle): CC 36, 37, 38, 39  on ch 0
   - Buttons (col 1–4 top):   note_on messages on ch 0, note numbers TBD
 
+Fader mapping (CC 36–39):
+  CC 36 → user_volume       [0.0–1.0]  user loop stem volume
+  CC 37 → voice_0_volume    [0.0–1.0]  AI Voice 1 stem volume
+  CC 38 → voice_1_volume    [0.0–1.0]  AI Voice 2 stem volume
+  CC 39 → voice_2_volume    [0.0–1.0]  AI Voice 3 stem volume
+
+Knob mapping (CC 32–35):
+  CC 32 → eq_bass    [-12 to +12 dB]  low shelf @ 250 Hz
+  CC 33 → eq_mid     [-12 to +12 dB]  peaking EQ @ 1 kHz
+  CC 34 → eq_treble  [-12 to +12 dB]  high shelf @ 4 kHz
+  CC 35 → reverb_wet [0.0–1.0]        Freeverb wet mix
+
 Button behavior:
-  - record_toggle: fires on every press; session state machine decides what to do
-      (first press → 2-bar count-in → record; press while recording → stop+loop;
-       press while playing → restart)
+  - record_toggle: fires on every press
   - voice_1_toggle, voice_2_toggle, voice_3_toggle: flip on/off each press
 
 Thread safety:
-  float/int attribute assignments are atomic under the GIL — GenerationParams fields
-  can be written from this thread and read from the main loop safely.
-  genre_weights uses a threading.Lock (list mutation is not atomic).
+  All callbacks are called from the MIDI thread — keep them fast or hand off
+  via queue/Event. Float attribute writes are atomic under the GIL.
 
 Usage:
     params = GenerationParams()
     ctrl = PBF4Controller(params, "config/pbf4_layout.json")
     ctrl.on("record_toggle",  session.handle_record)
     ctrl.on("voice_1_toggle", lambda: session.toggle_voice(0))
-    ctrl.on("voice_2_toggle", lambda: session.toggle_voice(1))
-    ctrl.on("voice_3_toggle", lambda: session.toggle_voice(2))
+    ctrl.on_user_volume(mixer.set_user_volume)
+    ctrl.on_voice_volume(0, lambda v: mixer.set_voice_volume(0, v))
+    ctrl.on_eq_bass(effects.set_eq_bass)
+    ctrl.on_reverb_wet(effects.set_reverb_wet)
     ctrl.start()
-    # ... run session ...
     ctrl.stop()
 """
 
@@ -49,25 +58,27 @@ logger = logging.getLogger(__name__)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Parameter scaling
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
-# label → (min, max, return_int)
+_BUTTON_LABELS = {"record_toggle", "voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
+_TOGGLE_LABELS = {"voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
+
+# Volume fader labels → scaled to [0.0, 1.0]
+_VOLUME_LABELS = {"user_volume", "voice_0_volume", "voice_1_volume", "voice_2_volume"}
+
+# EQ knob labels → scaled to [-12.0, +12.0] dB (CC 64 = 0 dB)
+_EQ_LABELS = {"eq_bass", "eq_mid", "eq_treble"}
+
+# Reverb knob label → scaled to [0.0, 1.0]
+_REVERB_LABEL = "reverb_wet"
+
+# Fallback for any layout entries that map to GenerationParams fields
 _PARAM_RANGES: Dict[str, tuple] = {
-    "guidance_weight": (0.0,  10.0, False),
-    "temperature":     (0.0,   2.0, False),
-    "model_feedback":  (0.0,   1.0, False),
-    "genre_0":         (0.0,   1.0, False),
-    "genre_1":         (0.0,   1.0, False),
-    "genre_2":         (0.0,   1.0, False),
-    "genre_3":         (0.0,   1.0, False),
+    "guidance_weight": (0.0, 10.0, False),
+    "temperature":     (0.0,  2.0, False),
+    "model_feedback":  (0.0,  1.0, False),
 }
-
-_CROSSFADE_LABEL = "crossfade"
-
-_BUTTON_LABELS  = {"record_toggle", "voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
-_TOGGLE_LABELS  = {"voice_1_toggle", "voice_2_toggle", "voice_3_toggle"}
-_GENRE_LABELS   = {"genre_0", "genre_1", "genre_2", "genre_3"}
 
 
 def _scale(raw: int, lo, hi, as_int: bool):
@@ -86,7 +97,8 @@ class PBF4Controller:
     Parameters
     ----------
     params : GenerationParams
-        Shared params object written by this thread, read by the main loop.
+        Shared params object (written for any layout entries that match
+        GenerationParams field names — currently unused with new knob layout).
     layout_path : str | Path
         Path to pbf4_layout.json.
     poll_interval : float
@@ -99,12 +111,21 @@ class PBF4Controller:
         self.layout_path = Path(layout_path)
         self.poll_interval = poll_interval
 
-        self.genre_weights: List[float] = [1.0, 0.0, 0.0, 0.0]
-        self._genre_lock = threading.Lock()
-        self._crossfade_cb: Optional[Callable] = None
-
+        # Button callbacks
         self._callbacks: Dict[str, List[Callable]] = {lbl: [] for lbl in _BUTTON_LABELS}
         self._toggle_state: Dict[str, bool] = {lbl: False for lbl in _TOGGLE_LABELS}
+
+        # CC callbacks — one callable per label, called with the scaled float value
+        self._cc_callbacks: Dict[str, Optional[Callable]] = {
+            "user_volume":   None,
+            "voice_0_volume": None,
+            "voice_1_volume": None,
+            "voice_2_volume": None,
+            "eq_bass":       None,
+            "eq_mid":        None,
+            "eq_treble":     None,
+            "reverb_wet":    None,
+        }
 
         # Lookup tables built from layout file
         self._cc_map:   Dict[tuple, dict] = {}   # (channel, cc)   → control dict
@@ -173,10 +194,7 @@ class PBF4Controller:
         logger.info("[PBF4] Layout loaded — %d CC controls, %d note buttons, %d skipped",
                     loaded_cc, loaded_note, skipped)
 
-    def reload_layout(self):
-        self._load_layout()
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
+    # ── Button callbacks ──────────────────────────────────────────────────────
 
     def on(self, event: str, callback: Callable):
         """
@@ -188,9 +206,31 @@ class PBF4Controller:
             raise ValueError(f"Unknown event '{event}'. Valid: {sorted(self._callbacks)}")
         self._callbacks[event].append(callback)
 
-    def on_crossfade(self, cb: Callable):
-        """Register callback for knob 3 crossfade. Called with pos [0.0–1.0]."""
-        self._crossfade_cb = cb
+    # ── CC callbacks (volume / EQ / reverb) ───────────────────────────────────
+
+    def on_user_volume(self, cb: Callable) -> None:
+        """Register callback for user loop fader. Called with float [0.0–1.0]."""
+        self._cc_callbacks["user_volume"] = cb
+
+    def on_voice_volume(self, voice_idx: int, cb: Callable) -> None:
+        """Register callback for AI voice fader (idx=0/1/2). Called with float [0.0–1.0]."""
+        self._cc_callbacks[f"voice_{voice_idx}_volume"] = cb
+
+    def on_eq_bass(self, cb: Callable) -> None:
+        """Register callback for bass EQ knob. Called with dB float [-12.0–+12.0]."""
+        self._cc_callbacks["eq_bass"] = cb
+
+    def on_eq_mid(self, cb: Callable) -> None:
+        """Register callback for mid EQ knob. Called with dB float [-12.0–+12.0]."""
+        self._cc_callbacks["eq_mid"] = cb
+
+    def on_eq_treble(self, cb: Callable) -> None:
+        """Register callback for treble EQ knob. Called with dB float [-12.0–+12.0]."""
+        self._cc_callbacks["eq_treble"] = cb
+
+    def on_reverb_wet(self, cb: Callable) -> None:
+        """Register callback for reverb knob. Called with float [0.0–1.0]."""
+        self._cc_callbacks["reverb_wet"] = cb
 
     # ── Thread control ─────────────────────────────────────────────────────────
 
@@ -215,27 +255,35 @@ class PBF4Controller:
 
     # ── Port selection ─────────────────────────────────────────────────────────
 
-    def _find_port(self) -> Optional[str]:
+    def _find_ports(self) -> list:
+        """Return all input port names containing the configured substring."""
         names = mido.get_input_names()
-        for name in names:
-            if self._port_name_substr.lower() in name.lower():
-                return name
-        logger.error("[PBF4] No port matching '%s'. Available: %s",
-                     self._port_name_substr, names)
-        return None
+        matches = [n for n in names if self._port_name_substr.lower() in n.lower()]
+        if not matches:
+            logger.error("[PBF4] No port matching '%s'. Available: %s",
+                         self._port_name_substr, names)
+        return matches
 
     # ── Listen loop ───────────────────────────────────────────────────────────
 
     def _listen_loop(self):
-        port_name = self._find_port()
-        if port_name is None:
+        candidates = self._find_ports()
+        if not candidates:
             return
 
-        logger.info("[PBF4] Listening on: %s", port_name)
-        try:
-            self._port = mido.open_input(port_name)
-        except Exception as e:
-            logger.error("[PBF4] Failed to open port: %s", e)
+        # The intech Grid exposes multiple ports (e.g. device 0 = SysEx/config,
+        # device 1 = MIDI I/O). Try each candidate in order; use the first that
+        # opens successfully.
+        for port_name in candidates:
+            logger.info("[PBF4] Trying port: %s", port_name)
+            try:
+                self._port = mido.open_input(port_name)
+                logger.info("[PBF4] Opened: %s", port_name)
+                break
+            except Exception as e:
+                logger.warning("[PBF4] Cannot open '%s': %s — trying next", port_name, e)
+        else:
+            logger.error("[PBF4] No usable port found among: %s", candidates)
             return
 
         while self._running.is_set():
@@ -244,7 +292,6 @@ class PBF4Controller:
                     self._handle_cc(msg)
                 elif msg.type == "note_on":
                     self._handle_note(msg)
-                # note_off / pitchwheel / etc. ignored
             time.sleep(self.poll_interval)
 
         self._port.close()
@@ -261,8 +308,6 @@ class PBF4Controller:
         self._apply_continuous(ctrl["label"], msg.value, ctrl.get("range"))
 
     def _handle_note(self, msg):
-        # Buttons: note_on vel=127 is press, vel=0 is release (some firmware sends
-        # note_on vel=0 instead of note_off). Only act on press.
         if msg.velocity == 0:
             return
 
@@ -288,56 +333,40 @@ class PBF4Controller:
                 logger.error("[PBF4] Callback error '%s': %s", label, e)
 
     def _apply_continuous(self, label: str, raw: int, range_override):
-        if label == _CROSSFADE_LABEL:
-            pos = raw / 127.0
-            logger.debug("[PBF4] crossfade = %.3f", pos)
-            if self._crossfade_cb is not None:
-                try:
-                    self._crossfade_cb(pos)
-                except Exception as e:
-                    logger.error("[PBF4] crossfade callback error: %s", e)
+        if label in _VOLUME_LABELS or label == _REVERB_LABEL:
+            val = raw / 127.0
+        elif label in _EQ_LABELS:
+            # CC 0 → -12 dB, CC 64 ≈ 0 dB, CC 127 → +12 dB
+            val = (raw / 127.0) * 24.0 - 12.0
+        elif label in _PARAM_RANGES:
+            lo, hi, as_int = _PARAM_RANGES[label]
+            if range_override is not None:
+                lo, hi  = range_override[0], range_override[1]
+                as_int  = isinstance(lo, int) and isinstance(hi, int)
+            val = _scale(raw, lo, hi, as_int)
+            setattr(self.params, label, val)
+            logger.info("[PBF4] %s = %s (raw=%d)", label, val, raw)
+            return
+        else:
+            logger.warning("[PBF4] No handler for CC label '%s'", label)
             return
 
-        if label in _GENRE_LABELS:
-            idx    = int(label[-1])
-            scaled = raw / 127.0
-            with self._genre_lock:
-                self.genre_weights[idx] = scaled
-            logger.debug("[PBF4] genre_%d = %.3f", idx, scaled)
-            return
-
-        if label not in _PARAM_RANGES:
-            logger.warning("[PBF4] No range for label '%s'", label)
-            return
-
-        lo, hi, as_int = _PARAM_RANGES[label]
-        if range_override is not None:
-            lo, hi  = range_override[0], range_override[1]
-            as_int  = isinstance(lo, int) and isinstance(hi, int)
-
-        value = _scale(raw, lo, hi, as_int)
-        setattr(self.params, label, value)
-        logger.debug("[PBF4] %s = %s (raw=%d)", label, value, raw)
+        cb = self._cc_callbacks.get(label)
+        if cb is not None:
+            try:
+                cb(val)
+            except Exception as e:
+                logger.error("[PBF4] %s callback error: %s", label, e)
+        logger.info("[PBF4] %s = %.3f (raw=%d)", label, val, raw)
 
     # ── Accessors ─────────────────────────────────────────────────────────────
-
-    def get_genre_weights(self) -> List[float]:
-        """Thread-safe snapshot of current genre weights [g0, g1, g2, g3]."""
-        with self._genre_lock:
-            return list(self.genre_weights)
 
     def get_toggle(self, label: str) -> bool:
         """Current on/off state for a toggle button label."""
         return self._toggle_state.get(label, False)
 
     def print_status(self):
-        p  = self.params
-        gw = self.get_genre_weights()
         print("[PBF4 Status]")
-        print(f"  guidance_weight = {p.guidance_weight:.2f}")
-        print(f"  temperature     = {p.temperature:.2f}")
-        print(f"  model_feedback  = {p.model_feedback:.3f}")
-        print(f"  genre_weights   = {[f'{w:.2f}' for w in gw]}")
         for lbl in _TOGGLE_LABELS:
             state = "ON" if self.get_toggle(lbl) else "OFF"
             print(f"  {lbl:18s} = {state}")
@@ -348,7 +377,7 @@ class PBF4Controller:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import sys, dataclasses, types
+    import sys, dataclasses
 
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s.%(msecs)03d  %(message)s",
                         datefmt="%H:%M:%S")
@@ -358,10 +387,10 @@ if __name__ == "__main__":
     except ImportError:
         @dataclasses.dataclass
         class GenerationParams:
-            guidance_weight: float = 1.5
-            temperature: float = 1.2
-            topk: int = 30
-            model_feedback: float = 0.95
+            guidance_weight: float = 3.0
+            temperature: float = 1.0
+            topk: int = 40
+            model_feedback: float = 0.7
             model_volume: float = 0.85
             beats_per_loop: int = 8
             bpm: int = 120
@@ -374,6 +403,14 @@ if __name__ == "__main__":
     ctrl.on("voice_1_toggle", lambda: print(f">>> Voice 1: {'ON' if ctrl.get_toggle('voice_1_toggle') else 'OFF'}"))
     ctrl.on("voice_2_toggle", lambda: print(f">>> Voice 2: {'ON' if ctrl.get_toggle('voice_2_toggle') else 'OFF'}"))
     ctrl.on("voice_3_toggle", lambda: print(f">>> Voice 3: {'ON' if ctrl.get_toggle('voice_3_toggle') else 'OFF'}"))
+    ctrl.on_user_volume(lambda v: print(f">>> user_volume = {v:.3f}"))
+    ctrl.on_voice_volume(0, lambda v: print(f">>> voice_0_volume = {v:.3f}"))
+    ctrl.on_voice_volume(1, lambda v: print(f">>> voice_1_volume = {v:.3f}"))
+    ctrl.on_voice_volume(2, lambda v: print(f">>> voice_2_volume = {v:.3f}"))
+    ctrl.on_eq_bass(lambda db: print(f">>> eq_bass = {db:.1f} dB"))
+    ctrl.on_eq_mid(lambda db: print(f">>> eq_mid = {db:.1f} dB"))
+    ctrl.on_eq_treble(lambda db: print(f">>> eq_treble = {db:.1f} dB"))
+    ctrl.on_reverb_wet(lambda v: print(f">>> reverb_wet = {v:.3f}"))
     ctrl.start()
 
     print("Listening. Move all controls. Ctrl+C to quit.\n")

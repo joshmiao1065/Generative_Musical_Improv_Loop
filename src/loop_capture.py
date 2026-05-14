@@ -118,7 +118,7 @@ class LoopCapture:
         self,
         device_idx: int,
         max_loop_seconds: float = 32.0,
-        blocksize: int = 2048,
+        blocksize: int = 256,
         sample_rate: int = SAMPLE_RATE,
     ):
         self.device_idx       = device_idx
